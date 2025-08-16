@@ -1,0 +1,41 @@
+# ========================
+# Ignore sensitive files
+# ========================
+.env
+*.env
+
+# ========================
+# Python cache & logs
+# ========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# ========================
+# Virtual environments
+# ========================
+.venv/
+venv/
+env/
+
+# ========================
+# Jupyter & notebook
+# ========================
+.ipynb_checkpoints
+
+# ========================
+# Docker
+# ========================
+*.pid
+*.seed
+*.bak
+*.swp
+*.tmp
+*.temp
+*.log
+
+# Ignore docker volumes/data
+data/
+volumes/
