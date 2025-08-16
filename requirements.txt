@@ -1,0 +1,13 @@
+# Exchange APIs
+ccxt>=4.2.99
+
+# Data & utils
+pandas>=2.0.0
+numpy>=1.24.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+loguru>=0.7.0
+
+# Optional: scheduling / retries (bỏ nếu chưa cần)
+schedule>=1.2.0
+tenacity>=8.2.3
