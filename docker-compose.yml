@@ -1,12 +1,19 @@
 services:
   fundingbot:
     build: .
+    image: fundingbot
     container_name: fundingbot
     restart: unless-stopped
     env_file:
       - .env
     volumes:
       - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
     logging:
       driver: json-file
       options:

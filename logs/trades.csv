@@ -1,0 +1,6 @@
+ts_iso,mode,action,symbol,edge_bps,need_bps,hours_left,exA,sideA,priceA,amountA,orderIdA,exB,sideB,priceB,amountB,orderIdB,notional_usdt,basis_bps,fill_ratio_A,fill_ratio_B,expected_funding_pnl_usdt,expected_pnl_usdt
+2025-08-17T03:24:27.527882+00:00,hybrid,error,LPT/USDT:USDT,10.347229,0.300000,4.636,bybit,buy,7.24800000,,,binanceusdm,sell,7.25300000,,,1000.00,-8.294,,,1.0347,1.0347
+2025-08-17T03:30:06.388625+00:00,hybrid,error,LPT/USDT:USDT,9.496291,0.300000,4.541,bybit,buy,7.25200000,,,binanceusdm,sell,7.25800000,,,1000.00,-8.269,,,0.9496,0.9496
+2025-08-17T03:40:39.880481+00:00,hybrid,error,XMR/USDT:USDT,8.627369,0.300000,4.326,binanceusdm,sell,255.78000000,,,bybit,buy,256.18000000,,,1000.00,12.504,,,0.8627,0.8627
+2025-08-17T04:19:49.104623+00:00,hybrid,error,XMR/USDT:USDT,6.954888,0.300000,3.674,binanceusdm,sell,258.87000000,,,bybit,buy,259.29000000,,,1000.00,16.598,,,0.6955,0.6955
+2025-08-17T04:59:14.062167+00:00,hybrid,dry_run,XMR/USDT:USDT,5.201539,0.300000,3.016,binanceusdm,sell,260.71000000,,,bybit,buy,260.66000000,,,29.32,6.521,,,0.0153,0.0153

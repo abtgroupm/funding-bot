@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, time, signal, csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import os
 from typing import Tuple, Optional, Dict, Any, List
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -48,104 +49,79 @@ class Config:
     hybrid_wait_seconds: int = 5
     hybrid_min_fill_ratio: float = 0.7
     hybrid_price_offset_bps: float = 0.8
-    # logging (orders/decisions)
+    # logging
     log_dir: str = "logs"
     log_file: str = "trades.csv"
-    # funding tracker (realized)
+    # funding tracker
     funding_collect: bool = True
-    funding_snapshot_secs: int = 300      # every 5 minutes write a snapshot
-    funding_lookback_hours: int = 12      # query last 12h payments
+    funding_snapshot_secs: int = 300
+    funding_lookback_hours: int = 12
     funding_log_file: str = "funding.csv"
-    # allow/deny list
-    allowlist: List[str] = None
-    denylist: List[str] = None
+    # allow/deny
+    allowlist: List[str] = field(default_factory=list)
+    denylist: List[str] = field(default_factory=list)
     # spike / timing filters
-    max_hours_left: float = 999.0         # only trade when hours_left <= this (set small like 0.75h)
-    spike_min_edge_bps: float = 0.0       # require |edge| >= this to treat as spike
-    
-    # dynamic notional
+    max_hours_left: float = 999.0
+    spike_min_edge_bps: float = 0.0
+    # === dynamic notional ===
     use_dynamic_notional: bool = False
     notional_pct: float = 0.10
-    min_notional_dyn: float = 500.0
-    max_notional_dyn: float = 20000.0
+    min_notional_usdt: float = 20.0
+    max_notional_usdt: float = 1000.0
     reserve_buffer_pct: float = 0.20
 
+def _to_bool(x: str, default=False) -> bool:
+    if x is None:
+        return default
+    return str(x).strip().lower() in ("1", "true", "yes", "on")
+
+def _parse_list_env(name: str) -> List[str]:
+    v = os.getenv(name)
+    if not v:
+        return []
+    parts = [p.strip() for p in v.replace(";", ",").split(",")]
+    return [p for p in parts if p]
+
 def load_config() -> Config:
+    load_dotenv(override=False)  # không ghi đè env có sẵn (Compose)
     cfg = Config()
-    load_dotenv()
-
-    # optional config.yaml
-    if os.path.exists("config.yaml") and yaml:
-        try:
-            with open("config.yaml", "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            for k, v in data.items():
-                if hasattr(cfg, k):
-                    setattr(cfg, k, v)
-        except Exception as e:
-            console.print(f"[yellow]Warn: cannot read config.yaml: {e}[/yellow]")
-
-    def getenv_num(name: str, cast, default):
-        val = os.getenv(name)
-        if val is None:
-            return default
-        try:
-            return cast(val)
-        except Exception:
-            return default
-
-    # basics
+    # basic
     cfg.symbol = os.getenv("SYMBOL", cfg.symbol)
+    cfg.leverage = int(os.getenv("LEVERAGE", cfg.leverage))
+    cfg.notional_usdt = float(os.getenv("NOTIONAL_USDT", cfg.notional_usdt))
+    cfg.min_edge_bps = float(os.getenv("MIN_EDGE_BPS", cfg.min_edge_bps))
+    cfg.take_profit_edge_bps = float(os.getenv("TAKE_PROFIT_EDGE_BPS", cfg.take_profit_edge_bps))
+    cfg.max_basis_bps = float(os.getenv("MAX_BASIS_BPS", cfg.max_basis_bps))
+    cfg.poll_seconds = int(os.getenv("POLL_SECONDS", cfg.poll_seconds))
+    cfg.dry_run = _to_bool(os.getenv("DRY_RUN"), cfg.dry_run)
     cfg.execution_mode = os.getenv("EXECUTION_MODE", cfg.execution_mode).lower()
-    cfg.leverage = int(getenv_num("LEVERAGE", int, cfg.leverage))
-    cfg.notional_usdt = float(getenv_num("NOTIONAL_USDT", float, cfg.notional_usdt))
-    cfg.min_edge_bps = float(getenv_num("MIN_EDGE_BPS", float, cfg.min_edge_bps))
-    cfg.take_profit_edge_bps = float(getenv_num("TAKE_PROFIT_EDGE_BPS", float, cfg.take_profit_edge_bps))
-    cfg.max_basis_bps = float(getenv_num("MAX_BASIS_BPS", float, cfg.max_basis_bps))
-    cfg.poll_seconds = int(getenv_num("POLL_SECONDS", int, cfg.poll_seconds))
-    env_dry = os.getenv("DRY_RUN")
-    if env_dry is not None:
-        cfg.dry_run = env_dry.lower() in ("1","true","yes","y")
-    # dynamic notional
-    cfg.use_dynamic_notional = os.getenv("USE_DYNAMIC_NOTIONAL", str(cfg.use_dynamic_notional)).lower() in ("1","true","yes","y")
-    cfg.notional_pct = float(getenv_num("NOTIONAL_PCT", float, cfg.notional_pct))
-    cfg.min_notional_dyn = float(getenv_num("MIN_NOTIONAL_USDT", float, cfg.min_notional_dyn))
-    cfg.max_notional_dyn = float(getenv_num("MAX_NOTIONAL_USDT", float, cfg.max_notional_dyn))
-    cfg.reserve_buffer_pct = float(getenv_num("RESERVE_BUFFER_PCT", float, cfg.reserve_buffer_pct))
-
     # multipair
-    cfg.multipair = os.getenv("MULTIPAIR", str(cfg.multipair)).lower() in ("1","true","yes","y")
-    cfg.min_volume_usdt = float(getenv_num("MIN_VOLUME_USDT", float, cfg.min_volume_usdt))
-    cfg.volume_x_notional = float(getenv_num("VOLUME_X_NOTIONAL", float, cfg.volume_x_notional))
-    cfg.depth_within_bps = float(getenv_num("DEPTH_WITHIN_BPS", float, cfg.depth_within_bps))
-    cfg.min_depth_multiplier = float(getenv_num("MIN_DEPTH_MULTIPLIER", float, cfg.min_depth_multiplier))
-    cfg.max_pairs_to_show = int(getenv_num("MAX_PAIRS_TO_SHOW", int, cfg.max_pairs_to_show))
-
+    cfg.multipair = _to_bool(os.getenv("MULTIPAIR"), cfg.multipair)
+    cfg.min_volume_usdt = float(os.getenv("MIN_VOLUME_USDT", cfg.min_volume_usdt))
+    cfg.volume_x_notional = float(os.getenv("VOLUME_X_NOTIONAL", cfg.volume_x_notional))
+    cfg.depth_within_bps = float(os.getenv("DEPTH_WITHIN_BPS", cfg.depth_within_bps))
+    cfg.min_depth_multiplier = float(os.getenv("MIN_DEPTH_MULTIPLIER", cfg.min_depth_multiplier))
+    cfg.max_pairs_to_show = int(os.getenv("MAX_PAIRS_TO_SHOW", cfg.max_pairs_to_show))
     # hybrid
-    cfg.hybrid_wait_seconds = int(getenv_num("HYBRID_WAIT_SECONDS", int, cfg.hybrid_wait_seconds))
-    cfg.hybrid_min_fill_ratio = float(getenv_num("HYBRID_MIN_FILL_RATIO", float, cfg.hybrid_min_fill_ratio))
-    cfg.hybrid_price_offset_bps = float(getenv_num("HYBRID_PRICE_OFFSET_BPS", float, cfg.hybrid_price_offset_bps))
-
-    # logging
-    cfg.log_dir = os.getenv("LOG_DIR", cfg.log_dir)
-    cfg.log_file = os.getenv("LOG_FILE", cfg.log_file)
-
-    # funding tracker
-    cfg.funding_collect = os.getenv("FUNDING_COLLECT", str(cfg.funding_collect)).lower() in ("1","true","yes","y")
-    cfg.funding_snapshot_secs = int(getenv_num("FUNDING_SNAPSHOT_SECS", int, cfg.funding_snapshot_secs))
-    cfg.funding_lookback_hours = int(getenv_num("FUNDING_LOOKBACK_HOURS", int, cfg.funding_lookback_hours))
-    cfg.funding_log_file = os.getenv("FUNDING_LOG_FILE", cfg.funding_log_file)
-
-    # allow/deny list
-    allow = os.getenv("ALLOWLIST", "").strip()
-    deny = os.getenv("DENYLIST", "").strip()
-    cfg.allowlist = [s.strip() for s in allow.split(",") if s.strip()] if allow else []
-    cfg.denylist = [s.strip() for s in deny.split(",") if s.strip()] if deny else []
-
-    # spike / timing filters
-    cfg.max_hours_left = float(getenv_num("MAX_HOURS_LEFT", float, cfg.max_hours_left))
-    cfg.spike_min_edge_bps = float(getenv_num("SPIKE_MIN_EDGE_BPS", float, cfg.spike_min_edge_bps))
-
+    cfg.hybrid_wait_seconds = int(os.getenv("HYBRID_WAIT_SECONDS", cfg.hybrid_wait_seconds))
+    cfg.hybrid_min_fill_ratio = float(os.getenv("HYBRID_MIN_FILL_RATIO", cfg.hybrid_min_fill_ratio))
+    cfg.hybrid_price_offset_bps = float(os.getenv("HYBRID_PRICE_OFFSET_BPS", cfg.hybrid_price_offset_bps))
+    # timing/spike
+    cfg.max_hours_left = float(os.getenv("MAX_HOURS_LEFT", cfg.max_hours_left))
+    cfg.spike_min_edge_bps = float(os.getenv("SPIKE_MIN_EDGE_BPS", cfg.spike_min_edge_bps))
+    # dynamic notional
+    cfg.use_dynamic_notional = _to_bool(os.getenv("USE_DYNAMIC_NOTIONAL"), cfg.use_dynamic_notional)
+    cfg.notional_pct = float(os.getenv("NOTIONAL_PCT", cfg.notional_pct))
+    cfg.min_notional_usdt = float(os.getenv("MIN_NOTIONAL_USDT", cfg.min_notional_usdt))
+    cfg.max_notional_usdt = float(os.getenv("MAX_NOTIONAL_USDT", cfg.max_notional_usdt))
+    cfg.reserve_buffer_pct = float(os.getenv("RESERVE_BUFFER_PCT", cfg.reserve_buffer_pct))
+    # allow/deny from env (comma/semicolon separated)
+    al = _parse_list_env("ALLOWLIST")
+    dl = _parse_list_env("DENYLIST")
+    if al:
+        cfg.allowlist = al
+    if dl:
+        cfg.denylist = dl
     return cfg
 
 # ==========================
@@ -361,36 +337,39 @@ def _fetch_free_usdt(ex) -> float:
     except Exception:
         return 0.0
 
+def _safe_get_free_usdt(ex) -> float:
+    try:
+        bal = ex.fetch_balance()
+        usdt = bal.get("USDT") or {}
+        free = usdt.get("free")
+        if free is None:
+            total, used = usdt.get("total", 0.0), usdt.get("used", 0.0)
+            free = max(0.0, float(total) - float(used))
+        return float(free or 0.0)
+    except Exception:
+        return 0.0
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
 def compute_dynamic_notional_usdt(cfg: Config, binance, bybit) -> float:
-    """Tính notional mỗi leg dựa trên free USDT thực tế của cả 2 sàn."""
     if not cfg.use_dynamic_notional:
-        return cfg.notional_usdt  # giữ nguyên static
-
-    free_bin = _fetch_free_usdt(binance)
-    free_byb = _fetch_free_usdt(bybit)
-
-    # chừa buffer an toàn
-    buf = max(0.0, min(0.95, cfg.reserve_buffer_pct))
-    eff_bin = max(0.0, free_bin * (1.0 - buf))
-    eff_byb = max(0.0, free_byb * (1.0 - buf))
-
-    # USD margin khả dụng ~ notional/leverage => notional tối đa có thể mở
-    # Đảm bảo không vượt sức chứa theo đòn bẩy mỗi sàn:
-    max_notional_bin = eff_bin * cfg.leverage
-    max_notional_byb = eff_byb * cfg.leverage
-
-    # Lấy MIN giữa hai sàn để cả hai leg đều khớp được
-    ceiling_both = max(0.0, min(max_notional_bin, max_notional_byb))
-
-    # Áp dụng tỉ lệ NOTIONAL_PCT trên "ceiling_both"
-    dyn = ceiling_both * max(0.0, min(1.0, cfg.notional_pct))
-
-    # Kẹp trong khoảng min/max (đặt trong .env)
-    dyn = max(cfg.min_notional_dyn, min(dyn, cfg.max_notional_dyn))
-
-    # nếu vì lý do nào đó quá nhỏ, fallback về cfg.notional_usdt để khỏi “0”
-    if dyn < 1.0:
-        dyn = cfg.notional_usdt
+        return float(cfg.notional_usdt)
+    free_bin = _safe_get_free_usdt(binance)
+    free_byb = _safe_get_free_usdt(bybit)
+    buf = float(cfg.reserve_buffer_pct)
+    safe_bin = max(0.0, free_bin * (1.0 - buf))
+    safe_byb = max(0.0, free_byb * (1.0 - buf))
+    lev = max(1.0, float(cfg.leverage))
+    pct = max(0.0, min(1.0, float(cfg.notional_pct)))
+    cap_bin = safe_bin * lev * pct
+    cap_byb = safe_byb * lev * pct
+    cap = min(cap_bin, cap_byb)
+    dyn = _clamp(cap, float(cfg.min_notional_usdt), float(cfg.max_notional_usdt))
+    try:
+        console.print(f"[dim]Dynamic notional: BIN free≈{free_bin:.2f}, BYB free≈{free_byb:.2f}, dyn≈{dyn:.2f} USDT[/dim]")
+    except Exception:
+        pass
     return float(dyn)
 
 
@@ -543,18 +522,35 @@ def _maker_price_from_orderbook(ex, symbol: str, side: str, offset_bps: float) -
         return None
 
 
+def _apply_amount_limits(ex, symbol: str, amount: float, price: Optional[float]) -> float:
+    try:
+        m = ex.market(symbol)
+        # precision (số chữ số thập phân)
+        prec = None
+        if isinstance(m.get("precision"), dict):
+            prec = m["precision"].get("amount")
+        if prec is not None and prec >= 0:
+            amount = round(float(amount), int(prec))
+        # min amount
+        limits = m.get("limits") or {}
+        min_amt = (limits.get("amount") or {}).get("min")
+        if min_amt is not None and amount < float(min_amt):
+            amount = float(min_amt)
+        # min cost (theo giá nếu có)
+        min_cost = (limits.get("cost") or {}).get("min")
+        if price and min_cost is not None:
+            if amount * float(price) < float(min_cost):
+                amount = float(min_cost) / float(price)
+        return float(amount)
+    except Exception:
+        return float(amount)
+
+
 def _qty_from_notional(ex, symbol: str, notional_usdt: float, price: float) -> float:
     if price <= 0:
         return 0.0
     amt = notional_usdt / price
-    try:
-        market = ex.market(symbol)
-        step = market.get("precision", {}).get("amount")
-        if step is not None and step > 0:
-            q = round(amt, int(step))
-            return q if q > 0 else amt
-    except Exception:
-        pass
+    amt = _apply_amount_limits(ex, symbol, amt, price)
     return amt
 
 
@@ -638,9 +634,14 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
             return
         amtA = _qty_from_notional(exA, symbol, notional_usdt, priceA)
         amtB = _qty_from_notional(exB, symbol, notional_usdt, priceB)
-        params = {"postOnly": True}
-        oA = _safe_create_order(exA, symbol, "limit", sideA, amtA, priceA, params)
-        oB = _safe_create_order(exB, symbol, "limit", sideB, amtB, priceB, params)
+        paramsA = {"postOnly": True}
+        paramsB = {"postOnly": True}
+        if getattr(exA, "id", "") == "binanceusdm":
+            paramsA["timeInForce"] = "GTX"
+        if getattr(exB, "id", "") == "binanceusdm":
+            paramsB["timeInForce"] = "GTX"
+        oA = _safe_create_order(exA, symbol, "limit", sideA, amtA, priceA, paramsA)
+        oB = _safe_create_order(exB, symbol, "limit", sideB, amtB, priceB, paramsB)
         logger.log({**log_base, "action": "placed_maker", "amountA": amtA, "amountB": amtB, "priceA": f"{priceA:.8f}", "priceB": f"{priceB:.8f}", "orderIdA": oA.get("id",""), "orderIdB": oB.get("id","")})
         console.print("[green]Placed maker (post-only) orders[/green]")
 
@@ -736,8 +737,9 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
         elif cfg.spike_min_edge_bps > 0 and abs(best_edge) < cfg.spike_min_edge_bps:
             console.print(f"[yellow]Skip: edge {best_edge:.3f} < spike_min_edge_bps {cfg.spike_min_edge_bps:.3f}[/yellow]")
         elif best_edge >= min_edge_effective:
+            dyn_notional = compute_dynamic_notional_usdt(cfg, binance, bybit)
             meta = {"edge_best": best_edge, "need": min_edge_effective, "hours_left": hours_left, "basis_bps": basis_bps}
-            place_delta_neutral(best_is_bin_short, cfg.notional_usdt, symbol, binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+            place_delta_neutral(best_is_bin_short, dyn_notional, symbol, binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
         else:
             console.print(f"[yellow]No entry: edge {best_edge:.3f} < need {min_edge_effective:.3f} bps[/yellow]")
 
@@ -766,22 +768,34 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
     while running:
         console.print(Panel.fit(header, style="bold white on blue"))
         syms = common_linear_usdt_symbols(binance, bybit)
+        console.print(f"[blue]Found {len(syms)} common symbols[/blue]")  # Add debug
+        
         rows = []
         dyn_min_vol = max(cfg.min_volume_usdt, cfg.volume_x_notional * cfg.notional_usdt)
-        min_depth = cfg.min_depth_multiplier * cfg.notional_usdt
-
+        min_depth_usdt = cfg.min_depth_multiplier * cfg.notional_usdt
+        console.print(
+            f"     Multipair scan (minVol=max({cfg.min_volume_usdt:,.0f}, "
+            f"{cfg.volume_x_notional}×{cfg.notional_usdt:,.0f})={dyn_min_vol:,.0f} USDT, "
+            f"depth≥{min_depth_usdt:,.0f} within ±{cfg.depth_within_bps:.1f} bps)"
+        )
+        
+        filtered_count = 0
         for sym in syms:
             # apply allow/deny filter
             if cfg.allowlist and sym not in cfg.allowlist:
                 continue
-            if sym in cfg.denylist:
+            if cfg.denylist and sym in cfg.denylist:
                 continue
-
             try:
                 v_bin = get_quote_volume_usdt(binance, sym)
                 v_byb = get_quote_volume_usdt(bybit, sym)
                 if v_bin < dyn_min_vol or v_byb < dyn_min_vol:
                     continue
+                    
+                filtered_count += 1
+                if filtered_count <= 5:  # Log first 5 symbols for debug
+                    console.print(f"[cyan]Processing {sym}: vol_bin={v_bin/1e6:.1f}M, vol_byb={v_byb/1e6:.1f}M[/cyan]")
+                
                 t_bin = binance.fetch_ticker(sym)
                 t_byb = bybit.fetch_ticker(sym)
                 p_bin = _to_float(t_bin.get("last")) or _to_float(t_bin.get("mark")) or _to_float(t_bin.get("close"))
@@ -791,7 +805,7 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
                     continue
                 bid_b, ask_b = orderbook_depth_usdt(binance, sym, cfg.depth_within_bps)
                 bid_y, ask_y = orderbook_depth_usdt(bybit, sym, cfg.depth_within_bps)
-                if min(bid_b, ask_b, bid_y, ask_y) < min_depth:
+                if min(bid_b, ask_b, bid_y, ask_y) < min_depth_usdt:
                     continue
                 fr_bin, h_bin = read_next_funding(binance, sym)
                 fr_byb, h_byb = read_next_funding(bybit, sym)
@@ -818,13 +832,16 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
                     "hours": h, "dir": ("BIN short" if best_bin_short else "BYB short"),
                     "vbin": v_bin, "vbyb": v_byb
                 })
-            except Exception:
+            except Exception as e:
+                if filtered_count <= 5:
+                    console.print(f"[red]Error processing {sym}: {e}[/red]")
                 continue
 
+        console.print(f"[blue]Processed {filtered_count} symbols, found {len(rows)} candidates[/blue]")
         rows.sort(key=lambda r: r["score"], reverse=True)
         top = rows[:cfg.max_pairs_to_show]
 
-        t2 = Table(title=f"Multipair scan (minVol≈{dyn_min_vol:,.0f} USDT, depth≥{min_depth:,.0f} within ±{cfg.depth_within_bps} bps)", box=box.SIMPLE_HEAVY)
+        t2 = Table(title=f"Multipair scan (minVol≈{dyn_min_vol:,.0f} USDT, depth≥{min_depth_usdt:,.0f} within ±{cfg.depth_within_bps} bps)", box=box.SIMPLE_HEAVY)
         for col in ["#","Symbol","Basis(bps)","Edge(bps)","Need(bps)","Score","H left","Dir","Vol BIN","Vol BYB"]:
             t2.add_column(col, justify="right" if col in {"#","Basis(bps)","Edge(bps)","Need(bps)","Score","H left","Vol BIN","Vol BYB"} else "left")
         for i, r in enumerate(top, 1):
@@ -835,7 +852,12 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
             best = top[0]
             console.print(f"[green]Best candidate meets threshold: {best['symbol']} (score {best['score']:.3f})[/green]")
             meta = {"edge_best": best['edge'], "need": best['need'], "hours_left": best['hours'], "basis_bps": best['basis']}
-            place_delta_neutral(best["dir"].startswith("BIN"), cfg.notional_usdt, best["symbol"], binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+            # ensure leverage for the chosen symbol
+            ensure_leverage(binance, best["symbol"], cfg.leverage, cfg.dry_run)
+            ensure_leverage(bybit,   best["symbol"], cfg.leverage, cfg.dry_run)
+            # dùng notional động
+            dyn_notional = compute_dynamic_notional_usdt(cfg, binance, bybit)
+            place_delta_neutral(best["dir"].startswith("BIN"), dyn_notional, best["symbol"], binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
         else:
             console.print("[yellow]No candidate meets edge threshold[/yellow]")
 
