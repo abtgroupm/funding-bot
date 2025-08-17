@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, time, signal, csv
 from dataclasses import dataclass, field
 import os
-from typing import Tuple, Optional, Dict, Any, List
+from typing import Tuple, Optional, Dict, Any, List, Set
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -35,6 +35,7 @@ class Config:
     min_edge_bps: float = 12.0
     take_profit_edge_bps: float = 3.0
     max_basis_bps: float = 10.0
+    basis_stop_delta_bps: float = 10.0
     poll_seconds: int = 20
     dry_run: bool = True
     execution_mode: str = "taker"  # maker | taker | hybrid
@@ -92,6 +93,7 @@ def load_config() -> Config:
     cfg.min_edge_bps = float(os.getenv("MIN_EDGE_BPS", cfg.min_edge_bps))
     cfg.take_profit_edge_bps = float(os.getenv("TAKE_PROFIT_EDGE_BPS", cfg.take_profit_edge_bps))
     cfg.max_basis_bps = float(os.getenv("MAX_BASIS_BPS", cfg.max_basis_bps))
+    cfg.basis_stop_delta_bps = float(os.getenv("BASIS_STOP_DELTA_BPS", cfg.basis_stop_delta_bps))
     cfg.poll_seconds = int(os.getenv("POLL_SECONDS", cfg.poll_seconds))
     cfg.dry_run = _to_bool(os.getenv("DRY_RUN"), cfg.dry_run)
     cfg.execution_mode = os.getenv("EXECUTION_MODE", cfg.execution_mode).lower()
@@ -412,7 +414,6 @@ def init_exchanges():
 # ==========================
 # Funding & positions
 # ==========================
-
 def ensure_leverage(ex, symbol: str, lev: int, dry_run: bool):
     if dry_run or not has_creds(ex):
         return
@@ -682,6 +683,35 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
         logger.log({**log_base, "action": "error", "exA": exA.id, "exB": exB.id})
 
 # ==========================
+# Close helpers (reduce-only)
+# ==========================
+def _close_leg_reduce_only(ex, symbol: str):
+    try:
+        poss = ex.fetch_positions([symbol]) or []
+    except Exception:
+        poss = []
+    for p in poss:
+        if p.get("symbol") != symbol:
+            continue
+        contracts = _to_float(p.get("contracts"))
+        if contracts == 0:
+            continue
+        side = _position_side(p, contracts)
+        amt = abs(contracts)
+        try:
+            if side == "long":
+                ex.create_order(symbol, "market", "sell", amt, None, {"reduceOnly": True})
+            elif side == "short":
+                ex.create_order(symbol, "market", "buy", amt, None, {"reduceOnly": True})
+        except Exception as e:
+            console.print(f"[yellow]Reduce-only close failed on {ex.id}: {e}[/yellow]")
+
+def close_delta_neutral(symbol: str, binance, bybit):
+    _close_leg_reduce_only(binance, symbol)
+    _close_leg_reduce_only(bybit,   symbol)
+    console.print(f"[green]Closed delta-neutral positions for {symbol}[/green]")
+
+# ==========================
 # Loops (single/multipair)
 # ==========================
 
@@ -703,6 +733,9 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
         nonlocal running
         running = False
     signal.signal(signal.SIGINT, handle_sigint)
+
+    last_h = None
+    weak_hits = 0
 
     while running:
         console.print(Panel.fit(header, style="bold white on blue"))
@@ -747,6 +780,39 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
         if funder:
             funder.maybe_snapshot(cfg, binance, bybit, symbol)
 
+        # After computing basis_bps, hours_left, best_edge, min_edge_effective...
+        # Auto-exit checks for single symbol
+        # 1) post-funding tick
+        if last_h is not None and last_h < 0.10 and hours_left > 7.5:
+            try:
+                close_delta_neutral(symbol, binance, bybit)
+            except Exception as e:
+                console.print(f"[red]Auto-exit (post-funding) failed: {e}[/red]")
+        last_h = hours_left
+
+        # 2) take-profit on weak edge or negative score
+        entry_fee_bps = 0.0 if cfg.execution_mode in ("maker","hybrid") else (taker_bps(binance, symbol) + taker_bps(bybit, symbol))
+        need_now = max(cfg.min_edge_bps, entry_fee_bps)
+        score_now = best_edge - need_now
+        if (best_edge <= cfg.take_profit_edge_bps) or (score_now < 0):
+            weak_hits += 1
+        else:
+            weak_hits = 0
+        if weak_hits >= 2:
+            try:
+                close_delta_neutral(symbol, binance, bybit)
+                weak_hits = 0
+            except Exception as e:
+                console.print(f"[red]Auto-exit (TP) failed: {e}[/red]")
+
+        # 3) basis stop
+        if abs(basis_bps) > (cfg.max_basis_bps + cfg.basis_stop_delta_bps):
+            try:
+                console.print(f"[red]Basis stop: |{basis_bps:.2f}| > {cfg.max_basis_bps}+{cfg.basis_stop_delta_bps} bps → closing {symbol}[/red]")
+                close_delta_neutral(symbol, binance, bybit)
+            except Exception as e:
+                console.print(f"[red]Auto-exit (basis stop) failed: {e}[/red]")
+
         time.sleep(max(1, int(cfg.poll_seconds)))
 
 
@@ -764,6 +830,10 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
         nonlocal running
         running = False
     signal.signal(signal.SIGINT, handle_sigint)
+
+    last_hours: Dict[str, float] = {}
+    decay_hits: Dict[str, int] = {}
+    decay_needed = 2
 
     while running:
         console.print(Panel.fit(header, style="bold white on blue"))
@@ -852,24 +922,95 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
             best = top[0]
             console.print(f"[green]Best candidate meets threshold: {best['symbol']} (score {best['score']:.3f})[/green]")
             meta = {"edge_best": best['edge'], "need": best['need'], "hours_left": best['hours'], "basis_bps": best['basis']}
-            # ensure leverage for the chosen symbol
             ensure_leverage(binance, best["symbol"], cfg.leverage, cfg.dry_run)
             ensure_leverage(bybit,   best["symbol"], cfg.leverage, cfg.dry_run)
-            # dùng notional động
             dyn_notional = compute_dynamic_notional_usdt(cfg, binance, bybit)
             place_delta_neutral(best["dir"].startswith("BIN"), dyn_notional, best["symbol"], binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
         else:
             console.print("[yellow]No candidate meets edge threshold[/yellow]")
 
-        # Funding snapshot (REAL) for top symbol (to limit API usage)
+        # ===== Auto-exit cho TẤT CẢ các symbol đang mở =====
+        try:
+            open_syms = (_open_symbols(binance) | _open_symbols(bybit))
+        except Exception:
+            open_syms = set()
+        for sym in list(open_syms):
+            try:
+                m = _collect_metrics_for_symbol(binance, bybit, cfg, sym)
+                basis = m["basis"]; h = m["hours"]; edge = m["edge"]; score = m["score"]
+            except Exception as e:
+                console.print(f"[red]Auto-exit calc failed on {sym}: {e}[/red]")
+                continue
+
+            # 1) Thoát ngay sau mốc funding: giờ còn lại vừa nhảy từ ~0 → ~8
+            prev_h = last_hours.get(sym); last_hours[sym] = h
+            if prev_h is not None and prev_h < 0.10 and h > 7.5:
+                try:
+                    close_delta_neutral(sym, binance, bybit)
+                    continue
+                except Exception as e:
+                    console.print(f"[red]Auto-exit (post-funding) failed on {sym}: {e}[/red]")
+
+            # 2) Take-profit: edge yếu hoặc score âm trong 2 nhịp liên tiếp
+            weak_now = (edge <= cfg.take_profit_edge_bps) or (score < 0)
+            decay_hits[sym] = decay_hits.get(sym, 0) + 1 if weak_now else 0
+            if decay_hits.get(sym, 0) >= decay_needed:
+                try:
+                    close_delta_neutral(sym, binance, bybit)
+                    decay_hits[sym] = 0
+                    continue
+                except Exception as e:
+                    console.print(f"[red]Auto-exit (TP) failed on {sym}: {e}[/red]")
+
+            # 3) Basis stop-loss
+            if abs(basis) > (cfg.max_basis_bps + cfg.basis_stop_delta_bps):
+                try:
+                    console.print(f"[red]Basis stop: |{basis:.2f}| > {cfg.max_basis_bps}+{cfg.basis_stop_delta_bps} bps → closing {sym}[/red]")
+                    close_delta_neutral(sym, binance, bybit)
+                except Exception as e:
+                    console.print(f"[red]Auto-exit (basis stop) failed on {sym}: {e}[/red]")
+
+        # Funding snapshot...
         if funder and top:
             funder.maybe_snapshot(cfg, binance, bybit, top[0]["symbol"])
 
-        time.sleep(max(1, int(cfg.poll_seconds)))
+def _open_symbols(ex) -> Set[str]:
+    """Danh sách symbol đang có vị thế (contracts != 0) trên 1 sàn."""
+    try:
+        poss = ex.fetch_positions() or []
+    except Exception:
+        poss = []
+    out: Set[str] = set()
+    for p in poss:
+        try:
+            contracts = _to_float(p.get("contracts"))
+            sym = p.get("symbol")
+            if sym and abs(contracts) > 0:
+                out.add(sym)
+        except Exception:
+            continue
+    return out
 
-# ==========================
-# Entrypoint
-# ==========================
+def _collect_metrics_for_symbol(binance, bybit, cfg: Config, sym: str) -> Dict[str, float]:
+    """Tính basis/edge/hours/need/score hiện tại cho 1 symbol."""
+    t_bin = binance.fetch_ticker(sym); t_byb = bybit.fetch_ticker(sym)
+    p_bin = _to_float(t_bin.get("last")) or _to_float(t_bin.get("mark")) or _to_float(t_bin.get("close"))
+    p_byb = _to_float(t_byb.get("last")) or _to_float(t_byb.get("mark")) or _to_float(t_byb.get("close"))
+    basis = get_basis_bps(p_bin, p_byb)
+    fr_b, h_b = read_next_funding(binance, sym)
+    fr_y, h_y = read_next_funding(bybit,   sym)
+    if h_b > 0 and h_y > 0:
+        h = min(h_b, h_y)
+    elif h_b > 0 or h_y > 0:
+        h = max(h_b, h_y)
+    else:
+        h = _hours_to_next_8h_utc(binance.milliseconds())
+    eA = funding_edge_now_bps(fr_b, fr_y, h); eB = funding_edge_now_bps(fr_y, fr_b, h)
+    edge = eA if eA >= eB else eB
+    entry_fee = 0.0 if cfg.execution_mode in ("maker","hybrid") else taker_bps(binance, sym) + taker_bps(bybit, sym)
+    need = max(cfg.min_edge_bps, entry_fee)
+    score = edge - need
+    return {"basis": basis, "hours": h, "edge": edge, "need": need, "score": score}
 
 def main():
     cfg = load_config()
@@ -877,15 +1018,10 @@ def main():
     binance, bybit = init_exchanges()
     logger = TradeLogger(cfg)
     funder = FundingTracker(cfg) if cfg.funding_collect else None
-
     if cfg.multipair:
-        return multipair_scan_and_trade(binance, bybit, cfg, logger, funder)
+        multipair_scan_and_trade(binance, bybit, cfg, logger, funder)
     else:
-        return single_pair_loop(binance, bybit, cfg, logger, funder)
+        single_pair_loop(binance, bybit, cfg, logger, funder)
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        console.print(f"[red]Fatal error:[/red] {e}")
-        raise
+    main()
