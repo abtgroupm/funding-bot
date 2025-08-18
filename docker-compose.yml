@@ -3,7 +3,7 @@ services:
     build: .
     image: fundingbot
     container_name: fundingbot
-    restart: unless-stopped
+    restart: on-failure           #unless-stopped
     env_file:
       - .env
     volumes:
