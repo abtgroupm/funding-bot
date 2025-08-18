@@ -76,6 +76,11 @@ class Config:
     min_notional_usdt: float = 20.0
     max_notional_usdt: float = 1000.0
     reserve_buffer_pct: float = 0.20
+    # Price arbitrage take profit & stoploss
+    price_arbitrage_tp_pct: float = 1.5  # % lãi để TP (kết hợp leverage)
+    price_arbitrage_sl_pct: float = -2.0  # % lỗ để StopLoss (kết hợp leverage)
+    price_arbitrage_min_hold_minutes: int = 10  # Thời gian tối thiểu giữ vị thế
+    funding_countdown_minutes: int = 30  # Thời gian đếm ngược đến funding để ưu tiên đợi
 
 def _to_bool(x: str, default=False) -> bool:
     if x is None:
@@ -599,7 +604,70 @@ def _cancel_silent(ex, order):
         pass
 
 
-def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, binance, bybit, dry_run: bool, mode: str, cfg: Config, logger: TradeLogger, meta: Dict[str, Any]):
+class TradeTracker:
+    """Lưu trữ thời gian mở vị thế cho các symbol."""
+    def __init__(self):
+        self.entry_times: Dict[str, float] = {}  # symbol -> timestamp
+        self.entry_prices: Dict[str, Dict[str, float]] = {}  # symbol -> {ex_id -> price}
+    
+    def record_entry(self, symbol: str, binance_price: Optional[float] = None, bybit_price: Optional[float] = None):
+        """Ghi lại thời gian và giá entry khi mở vị thế mới."""
+        self.entry_times[symbol] = time.time()
+        if symbol not in self.entry_prices:
+            self.entry_prices[symbol] = {}
+        if binance_price is not None:
+            self.entry_prices[symbol]["binance"] = binance_price
+        if bybit_price is not None:
+            self.entry_prices[symbol]["bybit"] = bybit_price
+    
+    def get_hold_minutes(self, symbol: str) -> float:
+        """Lấy số phút đã giữ vị thế."""
+        entry_time = self.entry_times.get(symbol)
+        if entry_time is None:
+            return 0.0
+        return (time.time() - entry_time) / 60.0
+    
+    def get_entry_prices(self, symbol: str) -> Dict[str, float]:
+        """Lấy giá entry của symbol."""
+        return self.entry_prices.get(symbol, {})
+
+    def clear_symbol(self, symbol: str):
+        """Xóa thông tin của một symbol."""
+        if symbol in self.entry_times:
+            del self.entry_times[symbol]
+        if symbol in self.entry_prices:
+            del self.entry_prices[symbol]
+
+# Khởi tạo global tracker
+TRADE_TRACKER = TradeTracker()
+
+def calculate_pnl_pct(bin_entry: float, bin_current: float, byb_entry: float, byb_current: float, 
+                     bin_side: str, leverage: int) -> float:
+    """
+    Tính % lãi/lỗ của cặp vị thế cross-exchange.
+    
+    Args:
+        bin_entry: Giá entry trên Binance
+        bin_current: Giá hiện tại trên Binance
+        byb_entry: Giá entry trên Bybit
+        byb_current: Giá hiện tại trên Bybit
+        bin_side: Phía Binance ("long" hoặc "short")
+        leverage: Đòn bẩy
+        
+    Returns:
+        % lãi/lỗ (đã tính leverage)
+    """
+    if bin_side == "long":  # Binance long, Bybit short
+        pnl_pct = ((bin_current / bin_entry - 1.0) - (byb_current / byb_entry - 1.0)) * 100 * leverage
+    else:  # Binance short, Bybit long
+        pnl_pct = ((1.0 - bin_current / bin_entry) - (1.0 - byb_current / byb_entry)) * 100 * leverage
+    
+    return pnl_pct
+
+# Sửa hàm place_delta_neutral để ghi nhận thời gian entry
+def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, binance, bybit, 
+                        dry_run: bool, mode: str, cfg: Config, logger: Optional[TradeLogger] = None,
+                        meta: Dict[str, Any] = None):
     sideA, sideB = ("sell", "buy") if bin_short else ("buy", "sell")
     exA, exB = (binance, bybit) if bin_short else (bybit, binance)
 
@@ -730,10 +798,12 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
         except Exception:
             pass
 
-def close_delta_neutral(symbol: str, binance, bybit):
+def close_delta_neutral(symbol: str, binance, bybit, dry_run: bool = False):
     _close_leg_reduce_only(binance, symbol)
     _close_leg_reduce_only(bybit,   symbol)
     console.print(f"[green]Closed delta-neutral positions for {symbol}[/green]")
+    # Xóa khỏi tracker
+    TRADE_TRACKER.clear_symbol(symbol)
     # notify + telemetry
     try:
         STATE.exit_count += 1
@@ -828,13 +898,16 @@ def _status_text(cfg: Config, binance, bybit) -> str:
     open_syms = (_open_symbols(binance) | _open_symbols(bybit))
     dyn = compute_dynamic_notional_usdt(cfg, binance, bybit) if cfg.use_dynamic_notional else cfg.notional_usdt
     uptime_min = int((time.time() - STATE.started_ts)/60)
-    return (
-        f"Mode: {'MULTIPAIR' if cfg.multipair else 'SINGLE'} {cfg.execution_mode.upper()}, dry_run={cfg.dry_run}\n"
-        f"Edge: min={cfg.min_edge_bps} | TP={cfg.take_profit_edge_bps} | Basis max={cfg.max_basis_bps} | Basis stop Δ={cfg.basis_stop_delta_bps}\n"
-        f"Notional: base={cfg.notional_usdt} dyn≈{_fmt_usdt(dyn)} (lev {cfg.leverage}x, pct {cfg.notional_pct}, buf {int(cfg.reserve_buffer_pct*100)}%)\n"
-        f"Scan: minVol={cfg.min_volume_usdt}, depthMult={cfg.min_depth_multiplier}, within={cfg.depth_within_bps} bps, maxH={cfg.max_hours_left}\n"
-        f"Open pairs: {len(open_syms)} | Entries={STATE.entry_count} Exits={STATE.exit_count} | Paused={STATE.paused}"
-    )
+    lines = [
+        f"Mode: {'MULTIPAIR' if cfg.multipair else 'SINGLE'} {cfg.execution_mode.upper()}, dry_run={cfg.dry_run}",
+        f"Uptime: {uptime_min} phút",
+        f"Open pairs: {len(open_syms)} | Entries={STATE.entry_count} Exits={STATE.exit_count} | Paused={STATE.paused}",
+        f"Notional: cơ bản={cfg.notional_usdt} dyn≈{_fmt_usdt(dyn)} (lev {cfg.leverage}x, pct {cfg.notional_pct}, buf {int(cfg.reserve_buffer_pct*100)}%)",
+        f"Scan: minVol={cfg.min_volume_usdt}, depthMult={cfg.min_depth_multiplier}, within={cfg.depth_within_bps} bps, maxH={cfg.max_hours_left}",
+    ]
+    lines.append(f"Edge: min={cfg.min_edge_bps:.1f} | TP={cfg.take_profit_edge_bps:.1f} | Basis max={cfg.max_basis_bps:.1f} | Basis stop Δ={cfg.basis_stop_delta_bps:.1f}")
+    lines.append(f"Price TP: {cfg.price_arbitrage_tp_pct:.1f}% | SL: {cfg.price_arbitrage_sl_pct:.1f}% | Min hold: {cfg.price_arbitrage_min_hold_minutes} min | Funding countdown: {cfg.funding_countdown_minutes} min")
+    return "\n".join(lines)
 
 def _set_pause(flag: bool) -> str:
     STATE.paused = bool(flag)
@@ -974,33 +1047,28 @@ def _send_menu() -> str:
     )
 
 def _wire_telegram(cfg: Config, binance, bybit):
-    """Khởi tạo và đăng ký lệnh Telegram nếu có token."""
+    # ...existing code lấy token/chat id...
+    global TELE
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id_env = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token:
-        return
     allowed_ids: Set[int] = set()
     default_chat = None
     if chat_id_env:
         for part in chat_id_env.replace(";", ",").split(","):
             s = part.strip()
             if s.isdigit():
-                n = int(s)
-                allowed_ids.add(n)
-                if default_chat is None:
-                    default_chat = n
-    global TELE
+                n = int(s); allowed_ids.add(n)
+                if default_chat is None: default_chat = n
     TELE = TelegramManager(token, allowed_ids, default_chat)
-    # Menu + alias
+
+    # các lệnh có sẵn
     TELE.on("/help",      lambda a, c: _send_menu())
     TELE.on("/menu",      lambda a, c: _send_menu())
     TELE.on("/start",     lambda a, c: (_set_pause(False) or _send_menu()))
     TELE.on("/stop",      lambda a, c: _set_pause(True))
     TELE.on("/count",     lambda a, c: f"Entries={STATE.entry_count} Exits={STATE.exit_count} Errors={STATE.last_error or 'None'}")
-    TELE.on("/balance",   lambda a, c: _balances_summary(binance, bybit))          # alias
-    TELE.on("/profit",    lambda a, c: "\n".join(_pnl_summary(binance) + _pnl_summary(bybit)))  # alias
-    TELE.on("/daily",     lambda a, c: "Not implemented yet")
-    TELE.on("/performance", lambda a, c: "Not implemented yet")
+    TELE.on("/balance",   lambda a, c: _balances_summary(binance, bybit))
+    TELE.on("/profit",    lambda a, c: "\n".join(_pnl_summary(binance) + _pnl_summary(bybit)))
     TELE.on("/status",    lambda a, c: _status_text(cfg, binance, bybit))
     TELE.on("/balances",  lambda a, c: _balances_summary(binance, bybit))
     TELE.on("/positions", lambda a, c: "\n".join(_positions_summary(binance) + _positions_summary(bybit)))
@@ -1008,9 +1076,20 @@ def _wire_telegram(cfg: Config, binance, bybit):
     TELE.on("/openpairs", lambda a, c: ", ".join(sorted(_open_symbols(binance) | _open_symbols(bybit))) or "None")
     TELE.on("/pause",     lambda a, c: _set_pause(True))
     TELE.on("/resume",    lambda a, c: _set_pause(False))
-    TELE.on("/shutdown", lambda a, c: _shutdown_cmd())  # NEW
+
+    # FIX: wire /set và alias
+    TELE.on("/set",       lambda a, c: _set_cmd_multi(a, cfg, binance, bybit))
+    TELE.on("set",        lambda a, c: _set_cmd_multi(a, cfg, binance, bybit))   # alias không có '/'
+
+    TELE.on("/close",     lambda a, c: _close_cmd(a, binance, bybit))
+    TELE.on("/closeleg",  lambda a, c: _closeleg_cmd(a, binance, bybit))
+    TELE.on("/shutdown",  lambda a, c: _shutdown_cmd())
     TELE.on("default",    lambda a, c: "Unknown. /help")
+
     TELE.start()
+
+    # log danh sách lệnh để kiểm tra nhanh
+    print("Telegram commands:", ", ".join(sorted(TELE.handlers.keys())))
     if TELE.default_chat_id:
         TELE.send("Bot online.\n" + _status_text(cfg, binance, bybit))
 
@@ -1040,7 +1119,7 @@ def main():
     if cfg.multipair:
         multipair_scan_and_trade(binance, bybit, cfg, logger, funder)
     else:
-        single_pair_loop(binance, bybit, cfg, logger, funder)
+        single_pair_loop(binance, bybit, cfg, logger, funder)  # Sửa dấu ngoặc
 
 def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: Optional[FundingTracker]):
     global RUNNING
@@ -1083,6 +1162,55 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
                 place_delta_neutral(bin_short, dyn_notional, symbol, binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
             else:
                 console.print(f"[yellow]Hold: score={score:.3f}, basis={basis_bps:.2f} bps, h_left={h_left:.2f}[/yellow]")
+
+            # Auto-exit cho symbol này nếu đang mở
+            open_syms = (_open_symbols(binance) | _open_symbols(bybit))
+            if symbol in open_syms:
+                # Kiểm tra funding sắp diễn ra không
+                funding_soon = h_left <= (cfg.funding_countdown_minutes / 60.0)
+                
+                # 0) Nếu funding sắp diễn ra (< 30 phút), ưu tiên đợi để thu funding
+                if funding_soon:
+                    console.print(f"[cyan]Funding soon for {symbol}: {h_left:.2f}h left, holding position[/cyan]")
+                else:
+                    # Kiểm tra price arbitrage TP/SL nếu đã giữ đủ lâu
+                    hold_minutes = TRADE_TRACKER.get_hold_minutes(symbol)
+                    if hold_minutes >= cfg.price_arbitrage_min_hold_minutes:
+                        try:
+                            # Lấy thông tin vị thế để xác định bên nào long/short
+                            positions_bin = _get_positions_by_symbol(binance, symbol)
+                            positions_byb = _get_positions_by_symbol(bybit, symbol)
+                            
+                            if positions_bin and positions_byb:
+                                pos_bin = positions_bin[0]
+                                pos_byb = positions_byb[0]
+                                
+                                bin_contracts = _to_float(pos_bin.get("contracts", 0))
+                                bin_side = "long" if bin_contracts > 0 else "short"
+                                
+                                # Lấy giá entry từ vị thế hoặc từ tracker
+                                entry_prices = TRADE_TRACKER.get_entry_prices(symbol)
+                                bin_entry = _to_float(pos_bin.get("entryPrice")) or entry_prices.get("binance", p_bin)
+                                byb_entry = _to_float(pos_byb.get("entryPrice")) or entry_prices.get("bybit", p_byb)
+                                
+                                # Tính P&L %
+                                pnl_pct = calculate_pnl_pct(bin_entry, p_bin, byb_entry, p_byb, bin_side, cfg.leverage)
+                                
+                                # StopLoss
+                                if pnl_pct <= cfg.price_arbitrage_sl_pct:
+                                    console.print(f"[red]StopLoss triggered for {symbol}: {pnl_pct:.2f}% ≤ {cfg.price_arbitrage_sl_pct}% → closing[/red]")
+                                    close_delta_neutral(symbol, binance, bybit)
+                                    continue
+                                
+                                # TakeProfit
+                                if pnl_pct >= cfg.price_arbitrage_tp_pct:
+                                    console.print(f"[green]Price arbitrage TP for {symbol}: {pnl_pct:.2f}% ≥ {cfg.price_arbitrage_tp_pct}% → closing[/green]")
+                                    close_delta_neutral(symbol, binance, bybit)
+                                    continue
+                                else:
+                                    console.print(f"[blue]Current P&L for {symbol}: {pnl_pct:.2f}%, held for {hold_minutes:.1f} min[/blue]")
+                        except Exception as e:
+                            console.print(f"[yellow]Price arbitrage check error on {symbol}: {e}[/yellow]")
 
             # Auto-exit cho symbol này nếu đang mở
             open_syms = (_open_symbols(binance) | _open_symbols(bybit))
@@ -1200,8 +1328,8 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
             for sym in list(open_syms):
                 try:
                     t_bin = binance.fetch_ticker(sym); t_byb = bybit.fetch_ticker(sym)
-                    p_bin = _to_float(t_bin.get("last")) or _to_float(t_bin.get("mark")) or _to_float(t_bin.get("close"))
-                    p_byb = _to_float(t_byb.get("last")) or _to_float(t_byb.get("mark")) or _to_float(t_byb.get("close"))
+                    p_bin = _to_float(t_bin.get("last")) or _to_float(t_bin.get("mark"))
+                    p_byb = _to_float(t_byb.get("last")) or _to_float(t_byb.get("mark"))
                     basis = get_basis_bps(p_bin, p_byb)
                     fr_b, h_b = read_next_funding(binance, sym)
                     fr_y, h_y = read_next_funding(bybit,   sym)
@@ -1215,25 +1343,71 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
                     console.print(f"[red]Auto-exit calc failed on {sym}: {e}[/red]")
                     continue
 
-                # 1) Sau mốc funding
+                # Kiểm tra thời gian cần đợi funding
+                funding_soon = h_left <= (cfg.funding_countdown_minutes / 60.0)
+                
+                # 1. Nếu funding sắp diễn ra (<30 phút), ưu tiên đợi để thu funding
+                if funding_soon:
+                    console.print(f"[cyan]Funding soon for {sym}: {h_left:.2f}h left, holding position[/cyan]")
+                    continue
+                    
+                # 2. Kiểm tra TP theo giá (price arbitrage) nếu đã giữ đủ lâu
+                hold_minutes = TRADE_TRACKER.get_hold_minutes(sym)
+                if hold_minutes >= cfg.price_arbitrage_min_hold_minutes:
+                    try:
+                        # Lấy thông tin vị thế để xác định bên nào long/short
+                        positions_bin = _get_positions_by_symbol(binance, sym)
+                        positions_byb = _get_positions_by_symbol(bybit, sym)
+                        
+                        if positions_bin and positions_byb:
+                            pos_bin = positions_bin[0]
+                            pos_byb = positions_byb[0]
+                            
+                            bin_contracts = _to_float(pos_bin.get("contracts", 0))
+                            bin_side = "long" if bin_contracts > 0 else "short"
+                            
+                            # Lấy giá entry từ vị thế hoặc từ tracker
+                            entry_prices = TRADE_TRACKER.get_entry_prices(sym)
+                            bin_entry = _to_float(pos_bin.get("entryPrice")) or entry_prices.get("binance", p_bin)
+                            byb_entry = _to_float(pos_byb.get("entryPrice")) or entry_prices.get("bybit", p_byb)
+                            
+                            # Tính P&L %
+                            pnl_pct = calculate_pnl_pct(bin_entry, p_bin, byb_entry, p_byb, bin_side, cfg.leverage)
+                            
+                            # THÊM: StopLoss
+                            if pnl_pct <= cfg.price_arbitrage_sl_pct:
+                                console.print(f"[red]StopLoss triggered for {sym}: {pnl_pct:.2f}% ≤ {cfg.price_arbitrage_sl_pct}% → closing[/red]")
+                                close_delta_neutral(sym, binance, bybit)
+                                continue
+                            
+                            # TakeProfit (đã có)
+                            if pnl_pct >= cfg.price_arbitrage_tp_pct:
+                                console.print(f"[green]Price arbitrage TP for {sym}: {pnl_pct:.2f}% ≥ {cfg.price_arbitrage_tp_pct}% → closing[/green]")
+                                close_delta_neutral(sym, binance, bybit)
+                                continue
+
+                            else:
+                                console.print(f"[blue]Current P&L for {sym}: {pnl_pct:.2f}%, held for {hold_minutes:.1f} min[/blue]")
+                    except Exception as e:
+                        console.print(f"[yellow]Price arbitrage check error on {sym}: {e}[/yellow]")
+                        
+                # 3. Các điều kiện thoát khác vẫn giữ nguyên
                 prev_h = last_hours.get(sym); last_hours[sym] = h_left
                 if prev_h is not None and prev_h < 0.10 and h_left > 7.5:
                     close_delta_neutral(sym, binance, bybit)
                     continue
-                # 2) TP theo edge/score (debounce)
+                    
                 weak_now = (edge <= cfg.take_profit_edge_bps) or (score < 0)
                 decay_hits[sym] = decay_hits.get(sym, 0) + 1 if weak_now else 0
                 if decay_hits.get(sym, 0) >= decay_needed:
                     close_delta_neutral(sym, binance, bybit)
                     decay_hits[sym] = 0
                     continue
-                # 3) Basis stop
+                    
                 if abs(basis) > (cfg.max_basis_bps + cfg.basis_stop_delta_bps):
                     console.print(f"[red]Basis stop: |{basis:.2f}| > {cfg.max_basis_bps}+{cfg.basis_stop_delta_bps} → closing {sym}[/red]")
                     close_delta_neutral(sym, binance, bybit)
-
-            if funder and top:
-                funder.maybe_snapshot(cfg, binance, bybit, top[0]["symbol"])
+                    continue
 
         except KeyboardInterrupt:
             console.print("[red]Ctrl+C detected. Exiting loop.[/red]")
@@ -1242,6 +1416,14 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
             console.print(f"[red]Multipair loop error: {e}[/red]")
             STATE.last_error = str(e)
         time.sleep(max(1, int(cfg.poll_seconds)))
+
+def _get_positions_by_symbol(ex, symbol: str) -> List[Dict[str, Any]]:
+    """Lấy thông tin vị thế cho một symbol cụ thể."""
+    try:
+        all_positions = ex.fetch_positions([symbol]) or []
+        return [p for p in all_positions if p.get("symbol") == symbol and abs(_to_float(p.get("contracts", 0))) > 0]
+    except Exception:
+        return []
 
 # Gọi main khi chạy trực tiếp
 if __name__ == "__main__":

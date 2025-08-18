@@ -1,8 +1,4 @@
-import json
-import time
-import threading
-import urllib.parse
-import urllib.request
+import json, time, threading, urllib.parse, urllib.request
 from typing import Callable, Dict, Optional, Set, Any
 
 class TelegramManager:
@@ -26,14 +22,12 @@ class TelegramManager:
         self._thread.start()
 
     def stop(self):
-        # yêu cầu dừng
+        # yêu cầu dừng + phá long-poll và join ngắn
         self._running = False
-        # "poke" 1 request ngắn để phá long-poll đang chờ
         try:
             self._api("getUpdates", {"timeout": 0, "offset": self._offset + 1})
         except Exception:
             pass
-        # chờ thread kết thúc tối đa 2s (không block vô hạn)
         if self._thread and self._thread.is_alive():
             try:
                 self._thread.join(timeout=2.0)
@@ -41,7 +35,6 @@ class TelegramManager:
                 pass
 
     def _api(self, method: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        # serialize reply_markup if dict/list
         payload: Dict[str, Any] = {}
         for k, v in (data or {}).items():
             if k == "reply_markup" and isinstance(v, (dict, list)):
@@ -53,26 +46,28 @@ class TelegramManager:
         with urllib.request.urlopen(req, timeout=35) as r:
             return json.loads(r.read().decode("utf-8"))
 
-    def reply_keyboard(self, rows, resize=True, one_time=False) -> Dict[str, Any]:
-        # rows: List[List[str]]
-        return {
-            "keyboard": [[{"text": b} for b in row] for row in rows],
-            "resize_keyboard": bool(resize),
-            "one_time_keyboard": bool(one_time),
-        }
-
     def send(self, text: str, chat_id: Optional[int] = None, keyboard: Optional[Any] = None):
         cid = chat_id or self.default_chat_id
         if not cid:
             return
-        payload: Dict[str, Any] = {"chat_id": cid, "text": text}
+        data: Dict[str, Any] = {"chat_id": cid, "text": text}
         if keyboard:
-            # keyboard có thể là list rows hoặc dict reply_markup
-            payload["reply_markup"] = self.reply_keyboard(keyboard) if isinstance(keyboard, list) else keyboard
+            data["reply_markup"] = keyboard
         try:
-            self._api("sendMessage", payload)
+            self._api("sendMessage", data)
         except Exception:
             pass
+
+    def _normalize_command(self, text: str) -> str:
+        """Chuẩn hóa lệnh, bỏ @ và xử lý đúng cách."""
+        if not text:
+            return ""
+        parts = text.split()
+        cmd = parts[0]
+        # Bỏ @botname nếu có
+        if '@' in cmd:
+            cmd = cmd.split('@')[0]
+        return cmd.lower()
 
     def _loop(self):
         while self._running:
@@ -92,10 +87,40 @@ class TelegramManager:
                         except Exception:
                             pass
                         continue
+                    
+                    # Xử lý command entities nếu có
+                    entities = msg.get("entities", [])
+                    cmd_entity = None
+                    for e in entities:
+                        if e.get("type") == "bot_command" and e.get("offset") == 0:
+                            cmd_entity = text[0:e.get("length", 0)].lower()
+                            break
+                    
+                    # Tách command và argument
                     parts = text.split(maxsplit=1)
-                    cmd = parts[0].lower()
+                    raw_cmd = parts[0].lower()
                     arg = parts[1] if len(parts) > 1 else ""
-                    handler = self.handlers.get(cmd) or self.handlers.get("default")
+                    
+                    # Ưu tiên cmd_entity nếu có
+                    cmd = cmd_entity or raw_cmd
+                    
+                    # Thử cả với và không có dấu /
+                    handlers_to_try = [cmd]
+                    if cmd.startswith('/'):
+                        handlers_to_try.append(cmd[1:])  # Không có /
+                    else:
+                        handlers_to_try.append('/' + cmd)  # Có /
+                        
+                    # Tìm handler phù hợp
+                    handler = None
+                    for try_cmd in handlers_to_try:
+                        if try_cmd in self.handlers:
+                            handler = self.handlers[try_cmd]
+                            break
+                    
+                    if not handler:
+                        handler = self.handlers.get("default")
+                        
                     if handler:
                         try:
                             reply = handler(arg, cid)
@@ -103,5 +128,6 @@ class TelegramManager:
                             reply = f"Error handling {cmd}: {e}"
                         if reply:
                             self.send(reply, cid)
-            except Exception:
+            except Exception as e:
+                print(f"Telegram loop error: {e}")
                 time.sleep(2)
