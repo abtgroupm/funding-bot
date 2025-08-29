@@ -57,7 +57,7 @@ class Config:
     hybrid_min_fill_ratio: float = 0.7
     hybrid_price_offset_bps: float = 0.8
     # logging
-    log_dir: str = "logs"
+    log_dir: str = "./logs"
     log_file: str = "trades.csv"
     # funding tracker
     funding_collect: bool = True
@@ -77,10 +77,18 @@ class Config:
     max_notional_usdt: float = 1000.0
     reserve_buffer_pct: float = 0.20
     # Price arbitrage take profit & stoploss
-    price_arbitrage_tp_pct: float = 1.5  # % lãi để TP (kết hợp leverage)
-    price_arbitrage_sl_pct: float = -2.0  # % lỗ để StopLoss (kết hợp leverage)
-    price_arbitrage_min_hold_minutes: int = 10  # Thời gian tối thiểu giữ vị thế
-    funding_countdown_minutes: int = 30  # Thời gian đếm ngược đến funding để ưu tiên đợi
+    price_arbitrage_tp_pct: float = float(os.getenv("PRICE_ARBITRAGE_TP_PCT", 1.5)) 
+    price_arbitrage_sl_pct: float = float(os.getenv("PRICE_ARBITRAGE_SL_PCT", -2.0))
+    price_arbitrage_min_hold_minutes: int = int(os.getenv("PRICE_ARBITRAGE_MIN_HOLD_MINUTES", 10))
+    funding_countdown_minutes: int = int(os.getenv("FUNDING_COUNTDOWN_MINUTES", 30))  
+
+    print(f"[CONFIG] TP={price_arbitrage_tp_pct}%, SL={price_arbitrage_sl_pct}%, "
+        f"MIN_HOLD={price_arbitrage_min_hold_minutes}m, FUNDING_COUNTDOWN={funding_countdown_minutes}m")
+
+    # --- HARD PRICE TP ---
+    hard_price_tp: bool = bool(int(os.getenv("HARD_PRICE_TP", "1")))  # 1=ON, 0=OFF
+    hard_tp_use_mark: bool = bool(int(os.getenv("HARD_TP_USE_MARK", "0")))  # 1=mark, 0=last
+
 
 def _to_bool(x: str, default=False) -> bool:
     if x is None:
@@ -664,6 +672,8 @@ def calculate_pnl_pct(bin_entry: float, bin_current: float, byb_entry: float, by
     
     return pnl_pct
 
+    
+
 # Sửa hàm place_delta_neutral để ghi nhận thời gian entry
 def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, binance, bybit, 
                         dry_run: bool, mode: str, cfg: Config, logger: Optional[TradeLogger] = None,
@@ -699,15 +709,48 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
         return
 
     try:
+            # === TAKER: đặt 2 chân theo kiểu "atomic" với rollback ===
+        amtA = _qty_from_notional(exA, symbol, notional_usdt, pA)
+        amtB = _qty_from_notional(exB, symbol, notional_usdt, pB)
+
         if mode == "taker":
-            amtA = _qty_from_notional(exA, symbol, notional_usdt, pA)
-            amtB = _qty_from_notional(exB, symbol, notional_usdt, pB)
-            oA = _safe_create_order(exA, symbol, "market", sideA, amtA)
-            oB = _safe_create_order(exB, symbol, "market", sideB, amtB)
-            log_base.update(action="placed_taker", amountA=f"{amtA}", amountB=f"{amtB}", orderIdA=oA.get("id",""), orderIdB=oB.get("id",""))
-            logger.log(log_base)
+            # 1) Gửi chân A
+            try:
+                oA = _safe_create_order(exA, symbol, "market", sideA, amtA)
+            except Exception as e:
+                console.print(f"[red]Leg-A failed ({exA.id}): {e}[/red]")
+                if logger:
+                    logger.log({**log_base, "action": "legA_failed", "exA": exA.id, "exB": exB.id, "error": str(e)})
+                return  # chưa mở chân nào, rút
+
+            # 2) Gửi chân B; nếu fail → rollback A (reduceOnly)
+            try:
+                oB = _safe_create_order(exB, symbol, "market", sideB, amtB)
+            except Exception as e:
+                console.print(f"[red]Leg-B failed ({exB.id}), rolling back leg-A: {e}[/red]")
+                if logger:
+                    logger.log({**log_base, "action": "legB_failed_rollback", "orderIdA": oA.get("id", ""), "error": str(e)})
+                # rollback: đóng ngay chân A (đối ứng, reduceOnly)
+                rb_sideA = "sell" if sideA == "buy" else "buy"
+                params = {"reduceOnly": True}
+                if getattr(exA, "id", "") == "bybit":
+                    params["timeInForce"] = "IOC"
+                try:
+                    _safe_create_order(exA, symbol, "market", rb_sideA, amtA, None, {"reduceOnly": True})
+                except Exception as e2:
+                    console.print(f"[red]Rollback failed on {exA.id}: {e2}[/red]")
+                    if logger:
+                        logger.log({**log_base, "action": "rollback_failed", "error": str(e2)})
+                return  # kết thúc vì đã rollback xong
+
+            # 3) Cả hai chân đã vào thành công
+            if logger:
+                logger.log({
+                    **log_base, "action": "placed_taker",
+                    "amountA": f"{amtA}", "amountB": f"{amtB}",
+                    "orderIdA": oA.get("id",""), "orderIdB": oB.get("id","")
+                })
             console.print("[green]Placed taker orders on both legs[/green]")
-            # notify + telemetry
             try:
                 STATE.entry_count += 1
                 if TELE:
@@ -1166,6 +1209,39 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
             # Auto-exit cho symbol này nếu đang mở
             open_syms = (_open_symbols(binance) | _open_symbols(bybit))
             if symbol in open_syms:
+                if cfg.hard_price_tp:
+                    try:
+                        # Lấy vị thế hiện tại ở 2 sàn
+                        positions_bin = _get_positions_by_symbol(binance, symbol)
+                        positions_byb = _get_positions_by_symbol(bybit, symbol)
+
+                        if positions_bin and positions_byb:
+                            pos_bin = positions_bin[0]
+                            pos_byb = positions_byb[0]
+
+                            # Xác định bên long/short theo contracts ở Binance
+                            bin_contracts = _to_float(pos_bin.get("contracts", 0))
+                            bin_side = "long" if bin_contracts > 0 else "short"
+
+                            # Lấy entry (ưu tiên từ vị thế; fallback về giá lúc vào do tracker lưu)
+                            entry_prices = TRADE_TRACKER.get_entry_prices(symbol)
+                            bin_entry = _to_float(pos_bin.get("entryPrice")) or entry_prices.get("binance", p_bin)
+                            byb_entry = _to_float(pos_byb.get("entryPrice")) or entry_prices.get("bybit",  p_byb)
+
+                            # Giá hiện tại đã có: p_bin, p_byb (last/mark/close fallback sẵn)
+                            pnl_pct = calculate_pnl_pct(
+                                bin_entry=bin_entry, bin_current=p_bin,
+                                byb_entry=byb_entry, byb_current=p_byb,
+                                bin_side=bin_side, leverage=cfg.leverage
+                            )
+
+                            if pnl_pct >= cfg.price_arbitrage_tp_pct:
+                                console.print(f"[green][HARD-TP] {symbol}: {pnl_pct:.2f}% ≥ {cfg.price_arbitrage_tp_pct}% → closing now[/green]")
+                                close_delta_neutral(symbol, binance, bybit)
+                                continue  # sang symbol kế tiếp sau khi đã đóng
+                    except Exception as e:
+                        console.print(f"[red][HARD-TP] error for {symbol}: {e}[/red]")
+
                 # Kiểm tra funding sắp diễn ra không
                 funding_soon = h_left <= (cfg.funding_countdown_minutes / 60.0)
                 
