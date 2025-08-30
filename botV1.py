@@ -172,19 +172,42 @@ class TradeLogger:
     ]
 
     def __init__(self, cfg: Config):
+        self._disabled = False
         self.dir = Path(cfg.log_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
         self.path = self.dir / cfg.log_file
-        if not self.path.exists():
-            with self.path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=self.FIELDS)
-                writer.writeheader()
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            # thử mở để kiểm tra quyền
+            if not self.path.exists():
+                with self.path.open("w", newline="", encoding="utf-8") as f:
+                    csv.DictWriter(f, fieldnames=self.FIELDS).writeheader()
+        except (PermissionError, OSError):
+            # fallback: /tmp/bot_logs
+            fallback = Path(os.getenv("TMPDIR", "/tmp")) / "bot_logs"
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+                self.dir = fallback
+                self.path = self.dir / cfg.log_file
+                if not self.path.exists():
+                    with self.path.open("w", newline="", encoding="utf-8") as f:
+                        csv.DictWriter(f, fieldnames=self.FIELDS).writeheader()
+                console.print(f"[yellow]No write permission in {cfg.log_dir}. Using {self.dir} instead.[/yellow]")
+            except Exception as e:
+                console.print(f"[red]TradeLogger disabled (cannot write logs anywhere): {e}[/red]")
+                self._disabled = True
 
     def log(self, row: Dict[str, Any]):
+        if self._disabled:
+            return
         row.setdefault("ts_iso", datetime.now(timezone.utc).isoformat())
-        with self.path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=self.FIELDS)
-            writer.writerow({k: row.get(k, "") for k in self.FIELDS})
+        try:
+            with self.path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FIELDS)
+                writer.writerow({k: row.get(k, "") for k in self.FIELDS})
+        except (PermissionError, OSError) as e:
+            console.print(f"[red]TradeLogger write failed: {e}. Disabling logger.[/red]")
+            self._disabled = True
+
 
 # ==========================
 # Funding Tracker (REAL payments)
@@ -197,16 +220,31 @@ class FundingTracker:
     ]
 
     def __init__(self, cfg: Config):
-        self.dir = Path(cfg.log_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.dir / cfg.funding_log_file
+        self._disabled = False
         self.snapshot_secs = max(60, int(cfg.funding_snapshot_secs))
         self.lookback_ms = max(1, int(cfg.funding_lookback_hours)) * 3600 * 1000
         self.last_snapshot_ms = 0
-        if not self.path.exists():
-            with self.path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=self.FIELDS)
-                writer.writeheader()
+
+        self.dir = Path(cfg.log_dir)
+        self.path = self.dir / cfg.funding_log_file
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            if not self.path.exists():
+                with self.path.open("w", newline="", encoding="utf-8") as f:
+                    csv.DictWriter(f, fieldnames=self.FIELDS).writeheader()
+        except PermissionError:
+            fallback = Path(os.getenv("TMPDIR", "/tmp")) / "bot_logs"
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+                self.dir = fallback
+                self.path = self.dir / cfg.funding_log_file
+                if not self.path.exists():
+                    with self.path.open("w", newline="", encoding="utf-8") as f:
+                        csv.DictWriter(f, fieldnames=self.FIELDS).writeheader()
+                console.print(f"[yellow]No write permission in {cfg.log_dir}. Using {self.dir} instead.[/yellow]")
+            except Exception as e:
+                console.print(f"[red]FundingTracker disabled: {e}[/red]")
+                self._disabled = True
 
     def _fetch_history(self, ex, symbol: str, since_ms: int) -> List[Dict[str, Any]]:
         # Hỗ trợ cả camelCase và snake_case
@@ -233,16 +271,22 @@ class FundingTracker:
         return c, s
 
     def maybe_snapshot(self, cfg: Config, binance, bybit, symbol: str):
+        if getattr(self, "_disabled", False):
+            return
+
         now_ms = int(time.time() * 1000)
         if now_ms - self.last_snapshot_ms < self.snapshot_secs * 1000:
             return
         self.last_snapshot_ms = now_ms
+
         since = now_ms - self.lookback_ms
         b_rows = self._fetch_history(binance, symbol, since)
-        y_rows = self._fetch_history(bybit,   symbol, since)
+        y_rows = self._fetch_history(bybit,  symbol, since)
+
         b_cnt, b_sum = self._sum_payments(b_rows)
         y_cnt, y_sum = self._sum_payments(y_rows)
         net = b_sum + y_sum
+
         row = {
             "ts_iso": datetime.now(timezone.utc).isoformat(),
             "symbol": symbol,
@@ -254,10 +298,20 @@ class FundingTracker:
             "bybit_sum_usdt": f"{y_sum:.6f}",
             "net_funding_usdt": f"{net:.6f}",
         }
-        with self.path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=self.FIELDS)
-            writer.writerow(row)
-        console.print(f"[blue]Funding snapshot:[/blue] net={net:.6f} USDT (BIN {b_sum:.6f}, BYB {y_sum:.6f}) for lookback {cfg.funding_lookback_hours}h")
+
+        try:
+            with self.path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FIELDS)
+                writer.writerow(row)
+        except (PermissionError, OSError) as e:
+            console.print(f"[red]FundingTracker write failed: {e}[/red]")
+            self._disabled = True
+            return
+
+        console.print(
+            f"[blue]Funding snapshot:[/blue] net={net:.6f} USDT "
+            f"(BIN {b_sum:.6f}, BYB {y_sum:.6f}) for {symbol}"
+        )
 
 # ==========================
 # Utils & math
