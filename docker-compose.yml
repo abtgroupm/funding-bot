@@ -3,8 +3,8 @@ services:
     build: .
     image: fundingbot
     container_name: fundingbot
-    user: "${UID:-1000}:${GID:-1000}"   
-    restart: unless-stopped          #unless-stopped
+    user: "1000:1000"   
+    restart: unless-stopped 
     env_file:
       - .env
     volumes:
