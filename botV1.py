@@ -896,8 +896,12 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
             pass
 
 def close_delta_neutral(symbol: str, binance, bybit, dry_run: bool = False):
-    _close_leg_reduce_only(binance, symbol)
-    _close_leg_reduce_only(bybit,   symbol)
+    """Close both legs concurrently to minimize lag between exchanges."""
+    # Run exits in parallel to reduce any perceived lag
+    t1 = threading.Thread(target=_close_leg_reduce_only, args=(binance, symbol))
+    t2 = threading.Thread(target=_close_leg_reduce_only, args=(bybit,   symbol))
+    t1.start(); t2.start()
+    t1.join();  t2.join()
     console.print(f"[green]Closed delta-neutral positions for {symbol}[/green]")
     # Xóa khỏi tracker
     TRADE_TRACKER.clear_symbol(symbol)
@@ -922,6 +926,17 @@ def _close_leg_reduce_only(ex, symbol: str):
         contracts = _to_float(p.get("contracts"))
         side = _position_side(p, contracts)
         params = {"reduceOnly": True}
+        # Bybit prefers IOC for reduce-only market to ensure immediate execution
+        if getattr(ex, "id", "") == "bybit":
+            params["timeInForce"] = "IOC"
+        # Binance USD-M in hedge mode needs explicit positionSide to close the correct leg
+        if getattr(ex, "id", "") == "binanceusdm":
+            if side == "long":
+                params["positionSide"] = "LONG"
+            elif side == "short":
+                params["positionSide"] = "SHORT"
+            # Faster acknowledgement from Binance
+            params["newOrderRespType"] = "RESULT"
         if side == "long" and contracts > 0:
             _safe_create_order(ex, symbol, "market", "sell", abs(contracts), None, params)
         elif side == "short" and contracts < 0:
