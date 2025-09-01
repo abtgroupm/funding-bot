@@ -927,6 +927,80 @@ def _close_leg_reduce_only(ex, symbol: str):
         elif side == "short" and contracts < 0:
             _safe_create_order(ex, symbol, "market", "buy",  abs(contracts), None, params)
 
+_LAST_FIX_TS: Dict[str, float] = {}
+
+def _reconcile_legs(symbol: str, binance, bybit, logger: Optional[TradeLogger] = None, size_tol: float = 0.05, cooldown_s: int = 5) -> bool:
+    """Return True if legs look consistent, False if we had to fix something.
+
+    Cooldown avoids repeated fixes/alerts when one side lags.
+    """
+    now = time.time()
+    if now - _LAST_FIX_TS.get(symbol, 0.0) < cooldown_s:
+        return True
+
+    pos_bin = _get_positions_by_symbol(binance, symbol)
+    pos_byb = _get_positions_by_symbol(bybit, symbol)
+
+    open_bin = bool(pos_bin)
+    open_byb = bool(pos_byb)
+
+    # 1) One side open, the other closed -> close the open side
+    if open_bin ^ open_byb:
+        ex_open = binance if open_bin else bybit
+        msg = _close_leg_reduce_only_single(ex_open, symbol)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY DETECTED {symbol}: only {ex_open.id} open → {msg}")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "asym_fix_one_leg", "symbol": symbol, "exchange": ex_open.id, "message": msg})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    # 2) Both closed -> consistent
+    if not open_bin and not open_byb:
+        return True
+
+    # 3) Both open -> check side and size
+    def _sig(p):
+        contracts = _to_float(p.get("contracts", 0))
+        side = 1 if contracts > 0 else -1
+        qty = abs(contracts)
+        return side, qty
+
+    s1, q1 = _sig(pos_bin[0]); s2, q2 = _sig(pos_byb[0])
+
+    # They must be opposite side
+    if s1 == s2:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY DETECTED {symbol}: same-side legs → force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "asym_fix_same_side", "symbol": symbol, "bin_side": s1, "byb_side": s2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    # Sizes should be close within tolerance
+    if max(q1, q2) > 0 and abs(q1 - q2) / max(q1, q2) > size_tol:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY DETECTED {symbol}: size mismatch ({q1:g} vs {q2:g}) → force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "asym_fix_size_mismatch", "symbol": symbol, "qty_bin": q1, "qty_byb": q2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    return True
 
 # ===== Helpers for Telegram summaries and control =====
 def _fmt_usdt(x: float) -> str:
@@ -1024,10 +1098,11 @@ def _close_leg_reduce_only_single(ex, symbol: str):
         side = _position_side(p, contracts)
         amt = abs(contracts)
         try:
-            if side == "long":
-                ex.create_order(symbol, "market", "sell", amt, None, {"reduceOnly": True})
-            else:
-                ex.create_order(symbol, "market", "buy", amt, None, {"reduceOnly": True})
+            params = {"reduceOnly": True}
+            if getattr(ex, "id", "") == "bybit":
+                params["timeInForce"] = "IOC"
+            side_close = "sell" if side == "long" else "buy"
+            ex.create_order(symbol, "market", side_close, amt, None, params)
             return f"{ex.id} {symbol}: closed {side} {amt:g}"
         except Exception as e:
             return f"{ex.id} {symbol} close failed: {e}"
@@ -1054,6 +1129,16 @@ def _closeleg_cmd(arg: str, binance, bybit) -> str:
     if ex_name.startswith("bybit"):
         return _close_leg_reduce_only_single(bybit, sym)
     return "Exchange must be BINANCEUSDM or BYBIT"
+
+def _reconcile_cmd(arg: str, binance, bybit, logger: TradeLogger) -> str:
+    sym = (arg or "").strip()
+    if not sym:
+        return "Usage: /reconcile SYMBOL"
+    try:
+        ok = _reconcile_legs(sym, binance, bybit, logger)
+        return f"{sym}: {'OK (balanced)' if ok else 'fixed (actions taken)'}"
+    except Exception as e:
+        return f"Reconcile error for {sym}: {e}"
 
 def _set_cmd_multi(arg: str, cfg: Config, binance, bybit) -> str:
     """Hỗ trợ /set KEY VALUE hoặc /set KEY=VAL KEY2=VAL2 ..."""
@@ -1140,10 +1225,11 @@ def _send_menu() -> str:
         "/openpairs | /pause | /resume | /shutdown | /count\n"
         "/set KEY=VAL ...\n"
         "/close SYMBOL | /closeleg BINANCEUSDM|BYBIT SYMBOL\n"
+        "/reconcile SYMBOL\n"
         "/help"
     )
 
-def _wire_telegram(cfg: Config, binance, bybit):
+def _wire_telegram(cfg: Config, binance, bybit, logger: TradeLogger):
     # ...existing code lấy token/chat id...
     global TELE
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -1180,6 +1266,7 @@ def _wire_telegram(cfg: Config, binance, bybit):
 
     TELE.on("/close",     lambda a, c: _close_cmd(a, binance, bybit))
     TELE.on("/closeleg",  lambda a, c: _closeleg_cmd(a, binance, bybit))
+    TELE.on("/reconcile", lambda a, c: _reconcile_cmd(a, binance, bybit, logger))
     TELE.on("/shutdown",  lambda a, c: _shutdown_cmd())
     TELE.on("default",    lambda a, c: "Unknown. /help")
 
@@ -1212,7 +1299,7 @@ def main():
     binance, bybit = init_exchanges()
     logger = TradeLogger(cfg)
     funder = FundingTracker(cfg) if cfg.funding_collect else None
-    _wire_telegram(cfg, binance, bybit)
+    _wire_telegram(cfg, binance, bybit, logger)
     if cfg.multipair:
         multipair_scan_and_trade(binance, bybit, cfg, logger, funder)
     else:
@@ -1257,12 +1344,25 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
                 dyn_notional = compute_dynamic_notional_usdt(cfg, binance, bybit)
                 meta = {"edge_best": best_edge, "need": need, "hours_left": h_left, "basis_bps": basis_bps}
                 place_delta_neutral(bin_short, dyn_notional, symbol, binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+                # Immediately reconcile; guard against API errors
+                try:
+                    if not _reconcile_legs(symbol, binance, bybit, logger):
+                        continue
+                except Exception as e:
+                    console.print(f"[yellow]Reconcile error on {symbol}: {e}[/yellow]")
+
             else:
                 console.print(f"[yellow]Hold: score={score:.3f}, basis={basis_bps:.2f} bps, h_left={h_left:.2f}[/yellow]")
 
             # Auto-exit cho symbol này nếu đang mở
             open_syms = (_open_symbols(binance) | _open_symbols(bybit))
             if symbol in open_syms:
+                try:
+                    if not _reconcile_legs(symbol, binance, bybit, logger):
+                        continue  # we just fixed/closed it; move on
+                except Exception as e:
+                    console.print(f"[yellow]Reconcile error on {symbol}: {e}[/yellow]")
+
                 if cfg.hard_price_tp:
                     try:
                         # Lấy vị thế hiện tại ở 2 sàn
@@ -1299,15 +1399,18 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
                 # Kiểm tra funding sắp diễn ra không
                 funding_soon = h_left <= (cfg.funding_countdown_minutes / 60.0)
                 
-                # 0) Nếu funding sắp diễn ra (< 30 phút), ưu tiên đợi để thu funding
+                # 0) If the Funding is about to take place (<30 minutes), priority is to wait for collection
+
                 if funding_soon:
                     console.print(f"[cyan]Funding soon for {symbol}: {h_left:.2f}h left, holding position[/cyan]")
                 else:
-                    # Kiểm tra price arbitrage TP/SL nếu đã giữ đủ lâu
+                    # Check Price Arbitrage TP/SL if you've been kept long enough
+
                     hold_minutes = TRADE_TRACKER.get_hold_minutes(symbol)
                     if hold_minutes >= cfg.price_arbitrage_min_hold_minutes:
                         try:
-                            # Lấy thông tin vị thế để xác định bên nào long/short
+                            # Get the position information to determine which side Long/Short
+
                             positions_bin = _get_positions_by_symbol(binance, symbol)
                             positions_byb = _get_positions_by_symbol(bybit, symbol)
                             
@@ -1318,12 +1421,13 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
                                 bin_contracts = _to_float(pos_bin.get("contracts", 0))
                                 bin_side = "long" if bin_contracts > 0 else "short"
                                 
-                                # Lấy giá entry từ vị thế hoặc từ tracker
+                                # Get the entry price from the position or from the tracker
+
                                 entry_prices = TRADE_TRACKER.get_entry_prices(symbol)
                                 bin_entry = _to_float(pos_bin.get("entryPrice")) or entry_prices.get("binance", p_bin)
                                 byb_entry = _to_float(pos_byb.get("entryPrice")) or entry_prices.get("bybit", p_byb)
-                                
-                                # Tính P&L %
+
+                                # Calculate P&L %
                                 pnl_pct = calculate_pnl_pct(bin_entry, p_bin, byb_entry, p_byb, bin_side, cfg.leverage)
                                 
                                 # StopLoss
@@ -1450,12 +1554,24 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
                 dyn_notional = compute_dynamic_notional_usdt(cfg, binance, bybit)
                 meta = {"edge_best": best["edge"], "need": best["need"], "hours_left": best["hours"], "basis_bps": best["basis"]}
                 place_delta_neutral(bin_short, dyn_notional, best["symbol"], binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+                # Immediately reconcile; guard against API errors
+                try:
+                    if not _reconcile_legs(best["symbol"], binance, bybit, logger):
+                        pass
+                except Exception as e:
+                    console.print(f"[yellow]Reconcile error on {best['symbol']}: {e}[/yellow]")
             else:
                 console.print("[yellow]No candidate meets edge threshold[/yellow]")
 
             # Auto-exit cho TẤT CẢ các symbol đang mở
             open_syms = (_open_symbols(binance) | _open_symbols(bybit))
             for sym in list(open_syms):
+                # Immediately check/fix asymmetry before any TP/SL calculations
+                try:
+                    if not _reconcile_legs(sym, binance, bybit, logger):
+                        continue
+                except Exception as e:
+                    console.print(f"[yellow]Reconcile error on {sym}: {e}[/yellow]")
                 try:
                     t_bin = binance.fetch_ticker(sym); t_byb = bybit.fetch_ticker(sym)
                     p_bin = _to_float(t_bin.get("last")) or _to_float(t_bin.get("mark"))
