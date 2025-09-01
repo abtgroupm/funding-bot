@@ -29,6 +29,7 @@ class BotState:
 TELE: Optional[TelegramManager] = None
 STATE = BotState()
 RUNNING = True  # NEW: global switch to exit loops
+_BINANCE_HEDGE_CACHE: Optional[bool] = None  # cache Binance position mode
 
 # ==========================
 # Config
@@ -488,6 +489,43 @@ def init_exchanges():
 
     return binance, bybit
 
+def _is_binance_hedge_mode(ex) -> bool:
+    """Detect if Binance USD-M is in Hedge Mode (dual side). Caches result.
+
+    Returns True for hedge mode, False otherwise.
+    """
+    global _BINANCE_HEDGE_CACHE
+    try:
+        if getattr(ex, "id", "") != "binanceusdm":
+            return False
+        if _BINANCE_HEDGE_CACHE is not None:
+            return bool(_BINANCE_HEDGE_CACHE)
+        # Env override if provided
+        env_val = os.getenv("BINANCE_HEDGE_MODE")
+        if env_val is not None:
+            _BINANCE_HEDGE_CACHE = str(env_val).strip().lower() in ("1", "true", "yes", "on")
+            return bool(_BINANCE_HEDGE_CACHE)
+        # Try Binance endpoint via ccxt to detect dual side position mode
+        for name in ("fapiPrivateGetPositionsideDual", "fapiPrivateGetPositionSideDual"):
+            fn = getattr(ex, name, None)
+            if callable(fn):
+                try:
+                    d = fn({}) or {}
+                    dual = d.get("dualSidePosition")
+                    if isinstance(dual, bool):
+                        _BINANCE_HEDGE_CACHE = dual
+                        return dual
+                    if isinstance(dual, str):
+                        val = dual.strip().lower() in ("true", "1")
+                        _BINANCE_HEDGE_CACHE = val
+                        return val
+                except Exception:
+                    pass
+        _BINANCE_HEDGE_CACHE = False
+    except Exception:
+        _BINANCE_HEDGE_CACHE = False
+    return bool(_BINANCE_HEDGE_CACHE)
+
 # ==========================
 # Funding & positions
 # ==========================
@@ -657,6 +695,46 @@ def _order_filled_ratio(ex, order) -> float:
         return 0.0
 
 
+def _market_active(ex, symbol: str) -> bool:
+    try:
+        m = ex.market(symbol)
+        return bool(m.get("active", True))
+    except Exception:
+        return True
+
+
+def _has_sufficient_margin(ex, notional_usdt: float, leverage: float, buffer: float = 1.05) -> bool:
+    try:
+        free = _safe_get_free_usdt(ex)
+        required = (notional_usdt / max(1.0, float(leverage))) * float(buffer)
+        return free >= required
+    except Exception:
+        return True
+
+
+def _preflight_both_legs(exA, sideA: str, priceA: float,
+                         exB, sideB: str, priceB: float,
+                         symbol: str, notional_usdt: float, leverage: float) -> Tuple[bool, str, float, float]:
+    """Validate both legs before placing any order.
+
+    Returns (ok, reason, amtA, amtB)."""
+    if priceA <= 0 or priceB <= 0:
+        return False, "invalid pricing", 0.0, 0.0
+    if not _market_active(exA, symbol) or not _market_active(exB, symbol):
+        return False, "market inactive", 0.0, 0.0
+
+    amtA = _qty_from_notional(exA, symbol, notional_usdt, priceA)
+    amtB = _qty_from_notional(exB, symbol, notional_usdt, priceB)
+    notionA = abs(amtA * priceA)
+    notionB = abs(amtB * priceB)
+    if amtA <= 0 or amtB <= 0 or notionA == 0 or notionB == 0:
+        return False, "amount too small or zero", amtA, amtB
+    # margin sufficiency check on both venues with small buffer
+    if not _has_sufficient_margin(exA, notionA, leverage) or not _has_sufficient_margin(exB, notionB, leverage):
+        return False, "insufficient margin", amtA, amtB
+    return True, "ok", amtA, amtB
+
+
 def _cancel_silent(ex, order):
     try:
         oid = order.get("id")
@@ -763,6 +841,15 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
         return
 
     try:
+        # Preflight for taker pricing (market/last-based)
+        ok_pf, reason_pf, _amtA, _amtB = _preflight_both_legs(
+            exA, sideA, pA, exB, sideB, pB, symbol, notional_usdt, cfg.leverage
+        )
+        if mode == "taker" and not ok_pf:
+            console.print(f"[yellow]Preflight failed ({reason_pf}); skip entry {symbol}[/yellow]")
+            if logger:
+                logger.log({**log_base, "action": "preflight_failed", "reason": reason_pf})
+            return
             # === TAKER: đặt 2 chân theo kiểu "atomic" với rollback ===
         amtA = _qty_from_notional(exA, symbol, notional_usdt, pA)
         amtB = _qty_from_notional(exB, symbol, notional_usdt, pB)
@@ -822,6 +909,15 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
             if mode == "hybrid":
                 return place_delta_neutral(bin_short, notional_usdt, symbol, binance, bybit, dry_run, "taker", cfg, logger, meta)
             return
+        # Preflight for maker/hybrid using quoted maker prices
+        ok_pf2, reason_pf2, _mAmtA, _mAmtB = _preflight_both_legs(
+            exA, sideA, priceA, exB, sideB, priceB, symbol, notional_usdt, cfg.leverage
+        )
+        if not ok_pf2:
+            console.print(f"[yellow]Preflight failed ({reason_pf2}); skip entry {symbol}[/yellow]")
+            if logger:
+                logger.log({**log_base, "action": "preflight_failed", "reason": reason_pf2})
+            return
         amtA = _qty_from_notional(exA, symbol, notional_usdt, priceA)
         amtB = _qty_from_notional(exB, symbol, notional_usdt, priceB)
         paramsA = {"postOnly": True}
@@ -872,8 +968,14 @@ def place_delta_neutral(bin_short: bool, notional_usdt: float, symbol: str, bina
         tB2 = exB.fetch_ticker(symbol)
         pA2 = _to_float(tA2.get("last")) or pA
         pB2 = _to_float(tB2.get("last")) or pB
-        amtA2 = _qty_from_notional(exA, symbol, rem, pA2)
-        amtB2 = _qty_from_notional(exB, symbol, rem, pB2)
+        # Final preflight for taker completion on remaining notional
+        ok_pf3, reason_pf3, amtA2, amtB2 = _preflight_both_legs(
+            exA, sideA, pA2, exB, sideB, pB2, symbol, rem, cfg.leverage
+        )
+        if not ok_pf3:
+            logger.log({**log_base, "action": "preflight_failed", "reason": f"hybrid_fallback: {reason_pf3}"})
+            console.print(f"[yellow]Hybrid fallback preflight failed ({reason_pf3}); skip completing {symbol}[/yellow]")
+            return
         oA2 = _safe_create_order(exA, symbol, "market", sideA, amtA2)
         oB2 = _safe_create_order(exB, symbol, "market", sideB, amtB2)
         logger.log({**log_base, "action": "hybrid_fallback_taker", "amountA": amtA2, "amountB": amtB2, "priceA": f"{pA2:.8f}", "priceB": f"{pB2:.8f}", "orderIdA": oA2.get("id",""), "orderIdB": oB2.get("id","")})
@@ -929,12 +1031,13 @@ def _close_leg_reduce_only(ex, symbol: str):
         # Bybit prefers IOC for reduce-only market to ensure immediate execution
         if getattr(ex, "id", "") == "bybit":
             params["timeInForce"] = "IOC"
-        # Binance USD-M in hedge mode needs explicit positionSide to close the correct leg
+        # Binance: only include positionSide when in hedge mode; omit in One-way mode
         if getattr(ex, "id", "") == "binanceusdm":
-            if side == "long":
-                params["positionSide"] = "LONG"
-            elif side == "short":
-                params["positionSide"] = "SHORT"
+            if _is_binance_hedge_mode(ex):
+                if side == "long":
+                    params["positionSide"] = "LONG"
+                elif side == "short":
+                    params["positionSide"] = "SHORT"
             # Faster acknowledgement from Binance
             params["newOrderRespType"] = "RESULT"
         if side == "long" and contracts > 0:
