@@ -1,0 +1,280 @@
+    t2 = threading.Thread(target=_close_leg_reduce_only, args=(bybit,   symbol))
+    t1.start(); t2.start()
+    t1.join();  t2.join()
+    console.print(f"[green]Closed delta-neutral positions for {symbol}[/green]")
+    # Xóa khỏi tracker
+    TRADE_TRACKER.clear_symbol(symbol)
+    # notify + telemetry
+    try:
+        STATE.exit_count += 1
+        if TELE:
+            TELE.send(f"EXIT {symbol}: reduce-only both legs")
+    except Exception:
+        pass
+
+def _close_leg_reduce_only(ex, symbol: str):
+    if not has_creds(ex):
+        return
+    try:
+        positions = ex.fetch_positions([symbol])
+    except Exception:
+        positions = []
+    for p in positions:
+        if p.get("symbol") != symbol:
+            continue
+        contracts = _to_float(p.get("contracts"))
+        side = _position_side(p, contracts)
+        params = {"reduceOnly": True}
+        # Bybit prefers IOC for reduce-only market to ensure immediate execution
+        if getattr(ex, "id", "") == "bybit":
+            params["timeInForce"] = "IOC"
+        # Binance: only include positionSide when in hedge mode; omit in One-way mode
+        if getattr(ex, "id", "") == "binanceusdm":
+            if _is_binance_hedge_mode(ex):
+                if side == "long":
+                    params["positionSide"] = "LONG"
+                elif side == "short":
+                    params["positionSide"] = "SHORT"
+            # Faster acknowledgement from Binance
+            params["newOrderRespType"] = "RESULT"
+        if side == "long" and contracts > 0:
+            _safe_create_order(ex, symbol, "market", "sell", abs(contracts), None, params)
+        elif side == "short" and contracts < 0:
+            _safe_create_order(ex, symbol, "market", "buy",  abs(contracts), None, params)
+
+_LAST_FIX_TS: Dict[str, float] = {}
+
+def _reconcile_legs(symbol: str, binance, bybit, logger: Optional[TradeLogger] = None, size_tol: float = 0.05, cooldown_s: int = 5) -> bool:
+    """Return True if legs look consistent, False if we had to fix something.
+
+    Cooldown avoids repeated fixes/alerts when one side lags.
+    """
+    now = time.time()
+    if now - _LAST_FIX_TS.get(symbol, 0.0) < cooldown_s:
+        return True
+
+    pos_bin = _get_positions_by_symbol(binance, symbol)
+    pos_byb = _get_positions_by_symbol(bybit, symbol)
+
+    open_bin = bool(pos_bin)
+    open_byb = bool(pos_byb)
+
+    # 1) One side open, the other closed -> close the open side
+    if open_bin ^ open_byb:
+        ex_open = binance if open_bin else bybit
+        msg = _close_leg_reduce_only_single(ex_open, symbol)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY DETECTED {symbol}: only {ex_open.id} open → {msg}")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "asym_fix_one_leg", "symbol": symbol, "exchange": ex_open.id, "message": msg})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    # 2) Both closed -> consistent
+    if not open_bin and not open_byb:
+        return True
+
+    # 3) Both open -> check side and size
+    def _sig(p):
+        contracts = _to_float(p.get("contracts", 0))
+        side = 1 if contracts > 0 else -1
+        qty = abs(contracts)
+        return side, qty
+
+    s1, q1 = _sig(pos_bin[0]); s2, q2 = _sig(pos_byb[0])
+
+    # They must be opposite side
+    if s1 == s2:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY DETECTED {symbol}: same-side legs → force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "asym_fix_same_side", "symbol": symbol, "bin_side": s1, "byb_side": s2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    # Sizes should be close within tolerance
+    if max(q1, q2) > 0 and abs(q1 - q2) / max(q1, q2) > size_tol:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY DETECTED {symbol}: size mismatch ({q1:g} vs {q2:g}) → force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "asym_fix_size_mismatch", "symbol": symbol, "qty_bin": q1, "qty_byb": q2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    return True
+
+# Variant: same-side reconcile for trend-follow mode
+def _reconcile_legs_same_side(symbol: str, binance, bybit, logger: Optional[TradeLogger] = None, size_tol: float = 0.05, cooldown_s: int = 5) -> bool:
+    now = time.time()
+    if now - _LAST_FIX_TS.get(symbol, 0.0) < cooldown_s:
+        return True
+
+    pos_bin = _get_positions_by_symbol(binance, symbol)
+    pos_byb = _get_positions_by_symbol(bybit, symbol)
+
+    open_bin = bool(pos_bin)
+    open_byb = bool(pos_byb)
+
+    if open_bin ^ open_byb:
+        ex_open = binance if open_bin else bybit
+        msg = _close_leg_reduce_only_single(ex_open, symbol)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY (trend) {symbol}: only {ex_open.id} open -> {msg}")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "trend_asym_fix_one_leg", "symbol": symbol, "exchange": ex_open.id, "message": msg})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    if not open_bin and not open_byb:
+        return True
+
+    def _sig(p):
+        contracts = _to_float(p.get("contracts", 0))
+        side = 1 if contracts > 0 else -1
+        qty = abs(contracts)
+        return side, qty
+
+    s1, q1 = _sig(pos_bin[0]); s2, q2 = _sig(pos_byb[0])
+
+    if s1 != s2:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY (trend) {symbol}: opposite legs -> force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "trend_asym_fix_opposite", "symbol": symbol, "bin_side": s1, "byb_side": s2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    if max(q1, q2) > 0 and abs(q1 - q2) / max(q1, q2) > size_tol:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY (trend) {symbol}: size mismatch ({q1:g} vs {q2:g}) -> force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "trend_asym_fix_size_mismatch", "symbol": symbol, "qty_bin": q1, "qty_byb": q2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    return True
+
+# ===== Helpers for Telegram summaries and control =====
+def _fmt_usdt(x: float) -> str:
+    try:
+        return f"{float(x):,.2f}"
+    except Exception:
+        return str(x)
+
+def _balances_summary(binance, bybit) -> str:
+    try:
+        b = binance.fetch_balance()
+    except Exception:
+        b = {}
+    try:
+        y = bybit.fetch_balance()
+    except Exception:
+        y = {}
+    def pick(d):
+        u = d.get("USDT") or {}
+        return _to_float(u.get("total")), _to_float(u.get("free")), _to_float(u.get("used"))
+    bt, bf, bu = pick(b); yt, yf, yu = pick(y)
+    return (
+        f"BINANCE — total:{_fmt_usdt(bt)} free:{_fmt_usdt(bf)} used:{_fmt_usdt(bu)}\n"
+        f"BYBIT   — total:{_fmt_usdt(yt)} free:{_fmt_usdt(yf)} used:{_fmt_usdt(yu)}"
+    )
+
+def _positions_summary(ex) -> List[str]:
+    out = []
+    try:
+        poss = ex.fetch_positions() or []
+    except Exception:
+        poss = []
+    for p in poss:
+        contracts = _to_float(p.get("contracts"))
+        if contracts == 0:
+            continue
+        sym = p.get("symbol")
+        side = _position_side(p, contracts)
+        entry = _to_float(p.get("entryPrice"))
+        mark  = _to_float(p.get("markPrice")) or _to_float(p.get("last"))
+        notion = _to_float(p.get("notional"))
+        out.append(f"{ex.id.upper()} {sym} {side} {contracts:g} @ {entry} mark {mark} notion≈{_fmt_usdt(notion)}")
+    return out or [f"{ex.id.upper()} None"]
+
+def _pnl_summary(ex) -> List[str]:
+    out = []
+    try:
+        poss = ex.fetch_positions() or []
+    except Exception:
+        poss = []
+    for p in poss:
+        contracts = _to_float(p.get("contracts"))
+        if contracts == 0:
+            continue
+        sym = p.get("symbol")
+        entry = _to_float(p.get("entryPrice"))
+        mark  = _to_float(p.get("markPrice")) or _to_float(p.get("last"))
+        try:
+            pnl = float(p.get("unrealizedPnl"))
+        except Exception:
+            pnl = (mark - entry) * contracts
+        out.append(f"{ex.id.upper()} {sym} uPnL≈{_fmt_usdt(pnl)} (entry {entry}, mark {mark}, qty {contracts:g})")
+    return out or [f"{ex.id.upper()} No open positions"]
+
+def _status_text(cfg: Config, binance, bybit) -> str:
+    open_syms = (_open_symbols(binance) | _open_symbols(bybit))
+    dyn = compute_dynamic_notional_usdt(cfg, binance, bybit) if cfg.use_dynamic_notional else cfg.notional_usdt
+    uptime_min = int((time.time() - STATE.started_ts)/60)
+    lines = [
+        f"Mode: {'MULTIPAIR' if cfg.multipair else 'SINGLE'} {cfg.execution_mode.upper()}, dry_run={cfg.dry_run}",
+        f"Uptime: {uptime_min} phút",
+        f"Open pairs: {len(open_syms)} | Entries={STATE.entry_count} Exits={STATE.exit_count} | Paused={STATE.paused}",
+        f"Notional: cơ bản={cfg.notional_usdt} dyn≈{_fmt_usdt(dyn)} (lev {cfg.leverage}x, pct {cfg.notional_pct}, buf {int(cfg.reserve_buffer_pct*100)}%)",
+        f"Scan: minVol={cfg.min_volume_usdt}, depthMult={cfg.min_depth_multiplier}, within={cfg.depth_within_bps} bps, maxH={cfg.max_hours_left}",
+    ]
+    lines.append(f"Edge: min={cfg.min_edge_bps:.1f} | TP={cfg.take_profit_edge_bps:.1f} | Basis max={cfg.max_basis_bps:.1f} | Basis stop Δ={cfg.basis_stop_delta_bps:.1f}")
+    lines.append(f"Price TP: {cfg.price_arbitrage_tp_pct:.1f}% | SL: {cfg.price_arbitrage_sl_pct:.1f}% | Min hold: {cfg.price_arbitrage_min_hold_minutes} min | Funding countdown: {cfg.funding_countdown_minutes} min")
+    return "\n".join(lines)
+
+def _set_pause(flag: bool) -> str:
+    STATE.paused = bool(flag)
+    return f"Paused={STATE.paused}"
+
+def _close_leg_reduce_only_single(ex, symbol: str):
+    try:
+        poss = ex.fetch_positions([symbol]) or []
+    except Exception as e:
+        return f"{ex.id} fetch_positions error: {e}"
+    for p in poss:
+        if p.get("symbol") != symbol:
+            continue
+        contracts = _to_float(p.get("contracts"))
+        if contracts == 0:
+            return f"{ex.id} {symbol}: no position"
+        side = _position_side(p, contracts)
+        amt = abs(contracts)
+        try:

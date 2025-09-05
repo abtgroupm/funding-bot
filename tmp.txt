@@ -1,0 +1,280 @@
+    def pick(d):
+        u = d.get("USDT") or {}
+        return _to_float(u.get("total")), _to_float(u.get("free")), _to_float(u.get("used"))
+    bt, bf, bu = pick(b); yt, yf, yu = pick(y)
+    return (
+        f"BINANCE — total:{_fmt_usdt(bt)} free:{_fmt_usdt(bf)} used:{_fmt_usdt(bu)}\n"
+        f"BYBIT   — total:{_fmt_usdt(yt)} free:{_fmt_usdt(yf)} used:{_fmt_usdt(yu)}"
+    )
+
+def _positions_summary(ex) -> List[str]:
+    out = []
+    try:
+        poss = ex.fetch_positions() or []
+    except Exception:
+        poss = []
+    for p in poss:
+        contracts = _to_float(p.get("contracts"))
+        if contracts == 0:
+            continue
+        sym = p.get("symbol")
+        side = _position_side(p, contracts)
+        entry = _to_float(p.get("entryPrice"))
+        mark  = _to_float(p.get("markPrice")) or _to_float(p.get("last"))
+        notion = _to_float(p.get("notional"))
+        out.append(f"{ex.id.upper()} {sym} {side} {contracts:g} @ {entry} mark {mark} notion≈{_fmt_usdt(notion)}")
+    return out or [f"{ex.id.upper()} None"]
+
+def _pnl_summary(ex) -> List[str]:
+    out = []
+    try:
+        poss = ex.fetch_positions() or []
+    except Exception:
+        poss = []
+    for p in poss:
+        contracts = _to_float(p.get("contracts"))
+        if contracts == 0:
+            continue
+        sym = p.get("symbol")
+        entry = _to_float(p.get("entryPrice"))
+        mark  = _to_float(p.get("markPrice")) or _to_float(p.get("last"))
+        try:
+            pnl = float(p.get("unrealizedPnl"))
+        except Exception:
+            pnl = (mark - entry) * contracts
+        out.append(f"{ex.id.upper()} {sym} uPnL≈{_fmt_usdt(pnl)} (entry {entry}, mark {mark}, qty {contracts:g})")
+    return out or [f"{ex.id.upper()} No open positions"]
+
+def _status_text(cfg: Config, binance, bybit) -> str:
+    open_syms = (_open_symbols(binance) | _open_symbols(bybit))
+    dyn = compute_dynamic_notional_usdt(cfg, binance, bybit) if cfg.use_dynamic_notional else cfg.notional_usdt
+    uptime_min = int((time.time() - STATE.started_ts)/60)
+    lines = [
+        f"Mode: {'MULTIPAIR' if cfg.multipair else 'SINGLE'} {cfg.execution_mode.upper()}, dry_run={cfg.dry_run}",
+        f"Uptime: {uptime_min} phút",
+        f"Open pairs: {len(open_syms)} | Entries={STATE.entry_count} Exits={STATE.exit_count} | Paused={STATE.paused}",
+        f"Notional: cơ bản={cfg.notional_usdt} dyn≈{_fmt_usdt(dyn)} (lev {cfg.leverage}x, pct {cfg.notional_pct}, buf {int(cfg.reserve_buffer_pct*100)}%)",
+        f"Scan: minVol={cfg.min_volume_usdt}, depthMult={cfg.min_depth_multiplier}, within={cfg.depth_within_bps} bps, maxH={cfg.max_hours_left}",
+    ]
+    lines.append(f"Edge: min={cfg.min_edge_bps:.1f} | TP={cfg.take_profit_edge_bps:.1f} | Basis max={cfg.max_basis_bps:.1f} | Basis stop Δ={cfg.basis_stop_delta_bps:.1f}")
+    lines.append(f"Price TP: {cfg.price_arbitrage_tp_pct:.1f}% | SL: {cfg.price_arbitrage_sl_pct:.1f}% | Min hold: {cfg.price_arbitrage_min_hold_minutes} min | Funding countdown: {cfg.funding_countdown_minutes} min")
+    return "\n".join(lines)
+
+def _set_pause(flag: bool) -> str:
+    STATE.paused = bool(flag)
+    return f"Paused={STATE.paused}"
+
+def _close_leg_reduce_only_single(ex, symbol: str):
+    try:
+        poss = ex.fetch_positions([symbol]) or []
+    except Exception as e:
+        return f"{ex.id} fetch_positions error: {e}"
+    for p in poss:
+        if p.get("symbol") != symbol:
+            continue
+        contracts = _to_float(p.get("contracts"))
+        if contracts == 0:
+            return f"{ex.id} {symbol}: no position"
+        side = _position_side(p, contracts)
+        amt = abs(contracts)
+        try:
+            params = {"reduceOnly": True}
+            if getattr(ex, "id", "") == "bybit":
+                params["timeInForce"] = "IOC"
+            side_close = "sell" if side == "long" else "buy"
+            ex.create_order(symbol, "market", side_close, amt, None, params)
+            return f"{ex.id} {symbol}: closed {side} {amt:g}"
+        except Exception as e:
+            return f"{ex.id} {symbol} close failed: {e}"
+    return f"{ex.id} {symbol}: not found"
+
+def _close_cmd(arg: str, binance, bybit) -> str:
+    sym = (arg or "").strip()
+    if not sym:
+        return "Usage: /close SYMBOL (vd: BTC/USDT:USDT)"
+    try:
+        close_delta_neutral(sym, binance, bybit)
+        return f"Closed both legs {sym}"
+    except Exception as e:
+        return f"Close failed: {e}"
+
+def _closeleg_cmd(arg: str, binance, bybit) -> str:
+    parts = (arg or "").split()
+    if len(parts) < 2:
+        return "Usage: /closeleg BINANCEUSDM|BYBIT SYMBOL"
+    ex_name = parts[0].strip().lower()
+    sym = " ".join(parts[1:]).strip()
+    if ex_name.startswith("binance"):
+        return _close_leg_reduce_only_single(binance, sym)
+    if ex_name.startswith("bybit"):
+        return _close_leg_reduce_only_single(bybit, sym)
+    return "Exchange must be BINANCEUSDM or BYBIT"
+
+def _reconcile_cmd(arg: str, binance, bybit, logger: TradeLogger) -> str:
+    sym = (arg or "").strip()
+    if not sym:
+        return "Usage: /reconcile SYMBOL"
+    try:
+        ok = _reconcile_legs(sym, binance, bybit, logger)
+        return f"{sym}: {'OK (balanced)' if ok else 'fixed (actions taken)'}"
+    except Exception as e:
+        return f"Reconcile error for {sym}: {e}"
+
+def _set_cmd_multi(arg: str, cfg: Config, binance, bybit) -> str:
+    """Hỗ trợ /set KEY VALUE hoặc /set KEY=VAL KEY2=VAL2 ..."""
+    allowed = {
+        "MIN_EDGE_BPS": ("min_edge_bps", float),
+        "TAKE_PROFIT_EDGE_BPS": ("take_profit_edge_bps", float),
+        "MAX_BASIS_BPS": ("max_basis_bps", float),
+        "BASIS_STOP_DELTA_BPS": ("basis_stop_delta_bps", float),
+        "MAX_HOURS_LEFT": ("max_hours_left", float),
+        "SPIKE_MIN_EDGE_BPS": ("spike_min_edge_bps", float),
+        "LEVERAGE": ("leverage", int),
+        "USE_DYNAMIC_NOTIONAL": ("use_dynamic_notional", "bool"),
+        "NOTIONAL_PCT": ("notional_pct", float),
+        "RESERVE_BUFFER_PCT": ("reserve_buffer_pct", float),
+        "MIN_NOTIONAL_USDT": ("min_notional_usdt", float),
+        "MAX_NOTIONAL_USDT": ("max_notional_usdt", float),
+    }
+    if not arg:
+        return "Usage: /set KEY VALUE | hoặc /set KEY=VAL KEY2=VAL2 ..."
+    pairs = []
+    tokens = arg.replace("\n", " ").split()
+    if len(tokens) == 2 and "=" not in tokens[0] and "=" not in tokens[1]:
+        pairs.append((tokens[0], tokens[1]))
+    else:
+        for tok in tokens:
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                pairs.append((k, v))
+    if not pairs:
+        return "Usage: /set KEY VALUE | hoặc /set KEY=VAL KEY2=VAL2 ..."
+
+    changes = []
+    leverage_changed = None
+    for k, v in pairs:
+        K = k.strip().upper()
+        if K not in allowed:
+            changes.append(f"Skip {K}: not allowed")
+            continue
+        attr, typ = allowed[K]
+        try:
+            if     typ == int:   newv = int(float(v))
+            elif   typ == float: newv = float(v)
+            elif   typ == "bool": newv = _to_bool(v, False)
+            else:                 newv = v
+            setattr(cfg, attr, newv)
+            changes.append(f"{K} -> {getattr(cfg, attr)}")
+            if K == "LEVERAGE":
+                leverage_changed = newv
+        except Exception as e:
+            changes.append(f"{K} failed: {e}")
+
+    if leverage_changed is not None:
+        for sym in (_open_symbols(binance) | _open_symbols(bybit)):
+            try:
+                ensure_leverage(binance, sym, leverage_changed, cfg.dry_run)
+                ensure_leverage(bybit,   sym, leverage_changed, cfg.dry_run)
+            except Exception:
+                pass
+
+    return "Updated:\n" + "\n".join(changes)
+
+def _open_symbols(ex) -> Set[str]:
+    """Danh sách symbol đang có vị thế (contracts != 0) trên 1 sàn."""
+    try:
+        poss = ex.fetch_positions() or []
+    except Exception:
+        poss = []
+    out: Set[str] = set()
+    for p in poss:
+        try:
+            contracts = _to_float(p.get("contracts"))
+            sym = p.get("symbol")
+            if sym and abs(contracts) > 0:
+                out.add(sym)
+        except Exception:
+            continue
+    return out
+
+def _send_menu() -> str:
+    # Menu đơn giản dạng text
+    return (
+        "Commands:\n"
+        "/status | /balances (/balance) | /positions | /pnl (/profit)\n"
+        "/openpairs | /pause | /resume | /shutdown | /count\n"
+        "/set KEY=VAL ...\n"
+        "/close SYMBOL | /closeleg BINANCEUSDM|BYBIT SYMBOL\n"
+        "/reconcile SYMBOL\n"
+        "/help"
+    )
+
+def _wire_telegram(cfg: Config, binance, bybit, logger: TradeLogger):
+    # ...existing code lấy token/chat id...
+    global TELE
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id_env = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    allowed_ids: Set[int] = set()
+    default_chat = None
+    if chat_id_env:
+        for part in chat_id_env.replace(";", ",").split(","):
+            s = part.strip()
+            if s.isdigit():
+                n = int(s); allowed_ids.add(n)
+                if default_chat is None: default_chat = n
+    TELE = TelegramManager(token, allowed_ids, default_chat)
+
+    # các lệnh có sẵn
+    TELE.on("/help",      lambda a, c: _send_menu())
+    TELE.on("/menu",      lambda a, c: _send_menu())
+    TELE.on("/start",     lambda a, c: (_set_pause(False) or _send_menu()))
+    TELE.on("/stop",      lambda a, c: _set_pause(True))
+    TELE.on("/count",     lambda a, c: f"Entries={STATE.entry_count} Exits={STATE.exit_count} Errors={STATE.last_error or 'None'}")
+    TELE.on("/balance",   lambda a, c: _balances_summary(binance, bybit))
+    TELE.on("/profit",    lambda a, c: "\n".join(_pnl_summary(binance) + _pnl_summary(bybit)))
+    TELE.on("/status",    lambda a, c: _status_text(cfg, binance, bybit))
+    TELE.on("/balances",  lambda a, c: _balances_summary(binance, bybit))
+    TELE.on("/positions", lambda a, c: "\n".join(_positions_summary(binance) + _positions_summary(bybit)))
+    TELE.on("/pnl",       lambda a, c: "\n".join(_pnl_summary(binance) + _pnl_summary(bybit)))
+    TELE.on("/openpairs", lambda a, c: ", ".join(sorted(_open_symbols(binance) | _open_symbols(bybit))) or "None")
+    TELE.on("/pause",     lambda a, c: _set_pause(True))
+    TELE.on("/resume",    lambda a, c: _set_pause(False))
+
+    # FIX: wire /set và alias
+    TELE.on("/set",       lambda a, c: _set_cmd_multi(a, cfg, binance, bybit))
+    TELE.on("set",        lambda a, c: _set_cmd_multi(a, cfg, binance, bybit))   # alias không có '/'
+
+    TELE.on("/close",     lambda a, c: _close_cmd(a, binance, bybit))
+    TELE.on("/closeleg",  lambda a, c: _closeleg_cmd(a, binance, bybit))
+    TELE.on("/reconcile", lambda a, c: _reconcile_cmd(a, binance, bybit, logger))
+    TELE.on("/shutdown",  lambda a, c: _shutdown_cmd())
+    TELE.on("default",    lambda a, c: "Unknown. /help")
+
+    TELE.start()
+
+    # log danh sách lệnh để kiểm tra nhanh
+    print("Telegram commands:", ", ".join(sorted(TELE.handlers.keys())))
+    if TELE.default_chat_id:
+        TELE.send("Bot online.\n" + _status_text(cfg, binance, bybit))
+
+# --- Shutdown command ---
+def _shutdown_cmd() -> str:
+    """Thoát tiến trình sau khi gửi phản hồi Telegram."""
+    global RUNNING
+    RUNNING = False
+    def _quit():
+        try:
+            if TELE:
+                TELE.stop()
+        except Exception:
+            pass
+        os._exit(0)  # thoát ngay, mã 0
+    threading.Timer(1.0, _quit).start()  # đợi 1s cho Telegram gửi xong
+    return "Shutting down..."
+
+# === main() ===
+def main():
+    cfg = load_config()
+    print_env_status()
+    binance, bybit = init_exchanges()
+    logger = TradeLogger(cfg)

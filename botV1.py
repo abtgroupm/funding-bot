@@ -4,15 +4,15 @@ from dataclasses import dataclass, field
 from typing import Tuple, Optional, Dict, Any, List, Set
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-import threading  # thêm ở đầu file
+import threading
 
-from dotenv import load_dotenv  # NEW
+from dotenv import load_dotenv
 import ccxt  # type: ignore
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
-from telegram_manager import TelegramManager  # keep import
+from telegram_manager import TelegramManager
 
 console = Console()
 
@@ -45,7 +45,7 @@ class Config:
     basis_stop_delta_bps: float = 10.0
     poll_seconds: int = 20
     dry_run: bool = True
-    execution_mode: str = "taker"  # maker | taker | hybrid
+    execution_mode: str = "maker"  # maker | taker | hybrid
     # multipair
     multipair: bool = False
     min_volume_usdt: float = 0.0
@@ -89,6 +89,13 @@ class Config:
     # --- HARD PRICE TP ---
     hard_price_tp: bool = bool(int(os.getenv("HARD_PRICE_TP", "1")))  # 1=ON, 0=OFF
     hard_tp_use_mark: bool = bool(int(os.getenv("HARD_TP_USE_MARK", "0")))  # 1=mark, 0=last
+
+    # --- Trend-follow settings (same direction on both exchanges) ---
+    trend_follow: bool = bool(int(os.getenv("TREND_FOLLOW", "0")))
+    trend_timeframe: str = os.getenv("TREND_TIMEFRAME", "1m")
+    trend_fast: int = int(os.getenv("TREND_FAST", "5"))
+    trend_slow: int = int(os.getenv("TREND_SLOW", "20"))
+    require_trend_dir_alignment: bool = bool(int(os.getenv("REQUIRE_TREND_DIR_ALIGNMENT", "1")))
 
 
 def _to_bool(x: str, default=False) -> bool:
@@ -630,6 +637,196 @@ def expected_funding_usdt(edge_bps: float, notional: float) -> float:
 # Execution helpers (maker/taker/hybrid) + logging
 # ==========================
 
+# ==========================
+# Trend detection and trend-follow entry
+# ==========================
+def _sma(values: List[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+def compute_trend_side(ex, symbol: str, timeframe: str, fast: int, slow: int) -> str:
+    """Return 'buy' for uptrend, 'sell' for downtrend based on SMA crossover.
+
+    Fallback to simple momentum if OHLCV fails.
+    """
+    try:
+        n = max(fast, slow) + 2
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=n) or []
+        closes = [float(x[4]) for x in ohlcv if x and len(x) >= 5]
+        if len(closes) >= slow:
+            f = _sma(closes[-fast:])
+            s = _sma(closes[-slow:])
+            return "buy" if f >= s else "sell"
+    except Exception:
+        pass
+    try:
+        t = ex.fetch_ticker(symbol)
+        last_ = _to_float(t.get("last")) or _to_float(t.get("close"))
+        prev_ = _to_float(t.get("previousClose")) or _to_float(t.get("open"))
+        return "buy" if last_ >= prev_ else "sell"
+    except Exception:
+        return "buy"
+
+def place_trend_follow_both(direction_side: str, notional_usdt: float, symbol: str,
+                            binance, bybit, dry_run: bool, mode: str, cfg: Config,
+                            logger: Optional[TradeLogger] = None, meta: Optional[Dict[str, Any]] = None):
+    sideA = sideB = (direction_side or "buy").lower()
+    exA, exB = binance, bybit
+
+    tA = exA.fetch_ticker(symbol)
+    tB = exB.fetch_ticker(symbol)
+    pA = _to_float(tA.get("last")) or _to_float(tA.get("mark")) or _to_float(tA.get("close"))
+    pB = _to_float(tB.get("last")) or _to_float(tB.get("mark")) or _to_float(tB.get("close"))
+
+    meta = meta or {}
+    log_base = dict(
+        mode=mode,
+        action="decision_trend",
+        symbol=symbol,
+        edge_bps=f"{meta.get('edge_best', 0.0):.6f}",
+        need_bps=f"{meta.get('need', 0.0):.6f}",
+        hours_left=f"{meta.get('hours_left', 0.0):.3f}",
+        exA=exA.id, sideA=sideA, priceA=f"{pA:.8f}", amountA="",
+        orderIdA="", exB=exB.id, sideB=sideB, priceB=f"{pB:.8f}", amountB="", orderIdB="",
+        notional_usdt=f"{notional_usdt:.2f}", basis_bps=f"{meta.get('basis_bps',0.0):.3f}",
+        fill_ratio_A="", fill_ratio_B="",
+        expected_funding_pnl_usdt=f"{expected_funding_usdt(meta.get('edge_best',0.0), notional_usdt):.4f}",
+        expected_pnl_usdt=f"{expected_funding_usdt(meta.get('edge_best',0.0), notional_usdt):.4f}"
+    )
+
+    if dry_run:
+        console.print(f"[cyan]DRY-RUN (trend): {exA.id} {sideA} / {exB.id} {sideB} | mode={mode} | notional≈{notional_usdt:.0f}[/cyan]")
+        if logger:
+            logger.log({**log_base, "action": "dry_run_trend"})
+        return
+
+    # Preflight
+    ok_pf, reason_pf, _amtA, _amtB = _preflight_both_legs(exA, sideA, pA, exB, sideB, pB, symbol, notional_usdt, cfg.leverage)
+    if mode == "taker" and not ok_pf:
+        console.print(f"[yellow]Preflight failed ({reason_pf}); skip trend entry {symbol}[/yellow]")
+        if logger:
+            logger.log({**log_base, "action": "preflight_failed_trend", "reason": reason_pf})
+        return
+
+    amtA = _qty_from_notional(exA, symbol, notional_usdt, pA)
+    amtB = _qty_from_notional(exB, symbol, notional_usdt, pB)
+
+    if mode == "taker":
+        try:
+            oA = _safe_create_order(exA, symbol, "market", sideA, amtA)
+        except Exception as e:
+            console.print(f"[red]Trend leg-A failed ({exA.id}): {e}[/red]")
+            if logger:
+                logger.log({**log_base, "action": "trend_legA_failed", "error": str(e)})
+            return
+        try:
+            oB = _safe_create_order(exB, symbol, "market", sideB, amtB)
+        except Exception as e:
+            console.print(f"[red]Trend leg-B failed ({exB.id}), rolling back A: {e}[/red]")
+            if logger:
+                logger.log({**log_base, "action": "trend_legB_failed_rollback", "orderIdA": oA.get("id", ""), "error": str(e)})
+            rb_sideA = "sell" if sideA == "buy" else "buy"
+            params = {"reduceOnly": True}
+            if getattr(exA, "id", "") == "bybit":
+                params["timeInForce"] = "IOC"
+            try:
+                _safe_create_order(exA, symbol, "market", rb_sideA, amtA, None, params)
+            except Exception:
+                pass
+            return
+        if logger:
+            logger.log({**log_base, "action": "placed_taker_trend", "amountA": f"{amtA}", "amountB": f"{amtB}", "orderIdA": oA.get("id",""), "orderIdB": oB.get("id","")})
+        console.print("[green]Placed taker trend orders on both exchanges[/green]")
+        try:
+            STATE.entry_count += 1
+            if TELE:
+                TELE.send(f"ENTER {symbol} (trend): {exA.id} {sideA}/{exB.id} {sideB} notional≈{notional_usdt:.0f}")
+        except Exception:
+            pass
+        return
+
+    # maker / hybrid
+    offset = cfg.hybrid_price_offset_bps
+    priceA = _maker_price_from_orderbook(exA, symbol, sideA, offset)
+    priceB = _maker_price_from_orderbook(exB, symbol, sideB, offset)
+    if not priceA or not priceB:
+        console.print("[red]Cannot fetch orderbook for maker pricing (trend)")
+        if mode == "hybrid":
+            return place_trend_follow_both(direction_side, notional_usdt, symbol, binance, bybit, dry_run, "taker", cfg, logger, meta)
+        return
+    ok_pf2, reason_pf2, _mAmtA, _mAmtB = _preflight_both_legs(exA, sideA, priceA, exB, sideB, priceB, symbol, notional_usdt, cfg.leverage)
+    if not ok_pf2:
+        console.print(f"[yellow]Preflight failed ({reason_pf2}); skip trend entry {symbol}[/yellow]")
+        if logger:
+            logger.log({**log_base, "action": "preflight_failed_trend", "reason": reason_pf2})
+        return
+    amtA = _qty_from_notional(exA, symbol, notional_usdt, priceA)
+    amtB = _qty_from_notional(exB, symbol, notional_usdt, priceB)
+    paramsA = {"postOnly": True}
+    paramsB = {"postOnly": True}
+    if getattr(exA, "id", "") == "binanceusdm":
+        paramsA["timeInForce"] = "GTX"
+    if getattr(exB, "id", "") == "binanceusdm":
+        paramsB["timeInForce"] = "GTX"
+    oA = _safe_create_order(exA, symbol, "limit", sideA, amtA, priceA, paramsA)
+    oB = _safe_create_order(exB, symbol, "limit", sideB, amtB, priceB, paramsB)
+    if logger:
+        logger.log({**log_base, "action": "placed_maker_trend", "amountA": amtA, "amountB": amtB, "priceA": f"{priceA:.8f}", "priceB": f"{priceB:.8f}", "orderIdA": oA.get("id",""), "orderIdB": oB.get("id","")})
+    console.print("[green]Placed maker (post-only) trend orders[/green]")
+
+    if mode == "maker":
+        try:
+            STATE.entry_count += 1
+            if TELE:
+                TELE.send(f"ENTER {symbol} (trend maker): {exA.id}/{exB.id} notional≈{notional_usdt:.0f}")
+        except Exception:
+            pass
+        return
+
+    time.sleep(max(1, int(cfg.hybrid_wait_seconds)))
+    rA = _order_filled_ratio(exA, oA)
+    rB = _order_filled_ratio(exB, oB)
+    if logger:
+        logger.log({**log_base, "action": "hybrid_check_trend", "fill_ratio_A": f"{rA:.4f}", "fill_ratio_B": f"{rB:.4f}"})
+    if rA >= cfg.hybrid_min_fill_ratio and rB >= cfg.hybrid_min_fill_ratio:
+        console.print("[green]Hybrid maker filled sufficiently (trend). Keeping maker orders.[/green]")
+        try:
+            STATE.entry_count += 1
+            if TELE:
+                TELE.send(f"ENTER {symbol} (trend maker-filled): rA={rA:.2f}, rB={rB:.2f}")
+        except Exception:
+            pass
+        return
+    _cancel_silent(exA, oA)
+    _cancel_silent(exB, oB)
+    remA = max(0.0, 1.0 - rA) * notional_usdt
+    remB = max(0.0, 1.0 - rB) * notional_usdt
+    rem = max(remA, remB)
+    if rem < 1:
+        if logger:
+            logger.log({**log_base, "action": "hybrid_all_filled_trend"})
+        return
+    tA2 = exA.fetch_ticker(symbol)
+    tB2 = exB.fetch_ticker(symbol)
+    pA2 = _to_float(tA2.get("last")) or pA
+    pB2 = _to_float(tB2.get("last")) or pB
+    ok_pf3, reason_pf3, amtA2, amtB2 = _preflight_both_legs(exA, sideA, pA2, exB, sideB, pB2, symbol, rem, cfg.leverage)
+    if not ok_pf3:
+        if logger:
+            logger.log({**log_base, "action": "preflight_failed_trend", "reason": f"hybrid_fallback: {reason_pf3}"})
+        console.print(f"[yellow]Hybrid fallback preflight failed (trend) {symbol}: {reason_pf3}[/yellow]")
+        return
+    oA2 = _safe_create_order(exA, symbol, "market", sideA, amtA2)
+    oB2 = _safe_create_order(exB, symbol, "market", sideB, amtB2)
+    if logger:
+        logger.log({**log_base, "action": "hybrid_fallback_taker_trend", "amountA": amtA2, "amountB": amtB2, "priceA": f"{pA2:.8f}", "priceB": f"{pB2:.8f}", "orderIdA": oA2.get("id",""), "orderIdB": oB2.get("id","")})
+    console.print("[green]Hybrid taker completion done (trend)")
+    try:
+        STATE.entry_count += 1
+        if TELE:
+            TELE.send(f"ENTER {symbol} (trend hybrid rem≈{rem:.0f} USDT)")
+    except Exception:
+        pass
+
 def _maker_price_from_orderbook(ex, symbol: str, side: str, offset_bps: float) -> Optional[float]:
     try:
         ob = ex.fetch_order_book(symbol, limit=5)
@@ -1120,6 +1317,71 @@ def _reconcile_legs(symbol: str, binance, bybit, logger: Optional[TradeLogger] =
 
     return True
 
+# Variant: same-side reconcile for trend-follow mode
+def _reconcile_legs_same_side(symbol: str, binance, bybit, logger: Optional[TradeLogger] = None, size_tol: float = 0.05, cooldown_s: int = 5) -> bool:
+    now = time.time()
+    if now - _LAST_FIX_TS.get(symbol, 0.0) < cooldown_s:
+        return True
+
+    pos_bin = _get_positions_by_symbol(binance, symbol)
+    pos_byb = _get_positions_by_symbol(bybit, symbol)
+
+    open_bin = bool(pos_bin)
+    open_byb = bool(pos_byb)
+
+    if open_bin ^ open_byb:
+        ex_open = binance if open_bin else bybit
+        msg = _close_leg_reduce_only_single(ex_open, symbol)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY (trend) {symbol}: only {ex_open.id} open -> {msg}")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "trend_asym_fix_one_leg", "symbol": symbol, "exchange": ex_open.id, "message": msg})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    if not open_bin and not open_byb:
+        return True
+
+    def _sig(p):
+        contracts = _to_float(p.get("contracts", 0))
+        side = 1 if contracts > 0 else -1
+        qty = abs(contracts)
+        return side, qty
+
+    s1, q1 = _sig(pos_bin[0]); s2, q2 = _sig(pos_byb[0])
+
+    if s1 != s2:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY (trend) {symbol}: opposite legs -> force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "trend_asym_fix_opposite", "symbol": symbol, "bin_side": s1, "byb_side": s2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    if max(q1, q2) > 0 and abs(q1 - q2) / max(q1, q2) > size_tol:
+        close_delta_neutral(symbol, binance, bybit)
+        try:
+            if TELE:
+                TELE.send(f"ASYMMETRY (trend) {symbol}: size mismatch ({q1:g} vs {q2:g}) -> force-closed both")
+        except Exception:
+            pass
+        if logger:
+            logger.log({"action": "trend_asym_fix_size_mismatch", "symbol": symbol, "qty_bin": q1, "qty_byb": q2})
+        TRADE_TRACKER.clear_symbol(symbol)
+        _LAST_FIX_TS[symbol] = now
+        return False
+
+    return True
+
 # ===== Helpers for Telegram summaries and control =====
 def _fmt_usdt(x: float) -> str:
     try:
@@ -1461,11 +1723,23 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
                 ensure_leverage(bybit,   symbol, cfg.leverage, cfg.dry_run)
                 dyn_notional = compute_dynamic_notional_usdt(cfg, binance, bybit)
                 meta = {"edge_best": best_edge, "need": need, "hours_left": h_left, "basis_bps": basis_bps}
-                place_delta_neutral(bin_short, dyn_notional, symbol, binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+                if cfg.trend_follow:
+                    trend_side = compute_trend_side(binance, symbol, cfg.trend_timeframe, cfg.trend_fast, cfg.trend_slow)
+                    # Funding Dir implies short bias; align if required
+                    if not cfg.require_trend_dir_alignment or (trend_side == "sell"):
+                        place_trend_follow_both(trend_side, dyn_notional, symbol, binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+                    else:
+                        console.print(f"[yellow]Skip entry: funding Dir is short but trend is {trend_side}[/yellow]")
+                else:
+                    place_delta_neutral(bin_short, dyn_notional, symbol, binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
                 # Immediately reconcile; guard against API errors
                 try:
-                    if not _reconcile_legs(symbol, binance, bybit, logger):
-                        continue
+                    if cfg.trend_follow:
+                        if not _reconcile_legs_same_side(symbol, binance, bybit, logger):
+                            continue
+                    else:
+                        if not _reconcile_legs(symbol, binance, bybit, logger):
+                            continue
                 except Exception as e:
                     console.print(f"[yellow]Reconcile error on {symbol}: {e}[/yellow]")
 
@@ -1476,8 +1750,12 @@ def single_pair_loop(binance, bybit, cfg: Config, logger: TradeLogger, funder: O
             open_syms = (_open_symbols(binance) | _open_symbols(bybit))
             if symbol in open_syms:
                 try:
-                    if not _reconcile_legs(symbol, binance, bybit, logger):
-                        continue  # we just fixed/closed it; move on
+                    if cfg.trend_follow:
+                        if not _reconcile_legs_same_side(symbol, binance, bybit, logger):
+                            continue
+                    else:
+                        if not _reconcile_legs(symbol, binance, bybit, logger):
+                            continue  # we just fixed/closed it; move on
                 except Exception as e:
                     console.print(f"[yellow]Reconcile error on {symbol}: {e}[/yellow]")
 
@@ -1658,10 +1936,27 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
             rows.sort(key=lambda r: r["score"], reverse=True)
             top = rows[:cfg.max_pairs_to_show]
 
+            # Log a timestamped snapshot when pairs are found
+            if logger and top:
+                best = top[0]
+                logger.log({
+                    "mode": cfg.execution_mode,
+                    "action": "found_pairs",
+                    "symbol": best["symbol"],
+                    "edge_bps": f"{best['edge']:.6f}",
+                    "need_bps": f"{best['need']:.6f}",
+                    "hours_left": f"{best['hours']:.3f}",
+                    "basis_bps": f"{best['basis']:.3f}",
+                    "exA": "binanceusdm", "exB": "bybit"
+                })
+
             table = Table(title=f"Multipair scan (minVol≈{dyn_min_vol:,.0f} USDT, depth≥{min_depth_usdt:,.0f} within ±{cfg.depth_within_bps} bps)", box=box.SIMPLE_HEAVY)
             table.add_column("#", justify="right"); table.add_column("Symbol"); table.add_column("Basis bps", justify="right"); table.add_column("Edge bps", justify="right"); table.add_column("Need", justify="right"); table.add_column("Score", justify="right"); table.add_column("H left", justify="right"); table.add_column("Dir"); table.add_column("Vol BIN", justify="right"); table.add_column("Vol BYB", justify="right")
             for i, r in enumerate(top, 1):
                 table.add_row(str(i), r["symbol"], f"{r['basis']:.2f}", f"{r['edge']:.3f}", f"{r['need']:.3f}", f"{r['score']:.3f}", f"{r['hours']:.2f}", r["dir"], f"{r['vol_bin']:.1f}", f"{r['vol_byb']:.1f}")
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            # Embed timestamp into the table title
+            table.title = f"Multipair scan (minVol≈{dyn_min_vol:,.0f} USDT, depth≈{min_depth_usdt:,.0f} within ±{cfg.depth_within_bps} bps) | Found at {ts}"
             console.print(table)
 
             if top and top[0]["score"] >= 0:
@@ -1671,11 +1966,23 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
                 ensure_leverage(bybit,   best["symbol"], cfg.leverage, cfg.dry_run)
                 dyn_notional = compute_dynamic_notional_usdt(cfg, binance, bybit)
                 meta = {"edge_best": best["edge"], "need": best["need"], "hours_left": best["hours"], "basis_bps": best["basis"]}
-                place_delta_neutral(bin_short, dyn_notional, best["symbol"], binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+                if cfg.trend_follow:
+                    trend_side = compute_trend_side(binance, best["symbol"], cfg.trend_timeframe, cfg.trend_fast, cfg.trend_slow)
+                    # Funding Dir string contains "short"; align if required
+                    if (not cfg.require_trend_dir_alignment) or ("short" in best["dir"].lower() and trend_side == "sell"):
+                        place_trend_follow_both(trend_side, dyn_notional, best["symbol"], binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
+                    else:
+                        console.print(f"[yellow]Skip entry {best['symbol']}: Dir={best['dir']} vs trend={trend_side}[/yellow]")
+                else:
+                    place_delta_neutral(bin_short, dyn_notional, best["symbol"], binance, bybit, cfg.dry_run, cfg.execution_mode, cfg, logger, meta)
                 # Immediately reconcile; guard against API errors
                 try:
-                    if not _reconcile_legs(best["symbol"], binance, bybit, logger):
-                        pass
+                    if cfg.trend_follow:
+                        if not _reconcile_legs_same_side(best["symbol"], binance, bybit, logger):
+                            pass
+                    else:
+                        if not _reconcile_legs(best["symbol"], binance, bybit, logger):
+                            pass
                 except Exception as e:
                     console.print(f"[yellow]Reconcile error on {best['symbol']}: {e}[/yellow]")
             else:
@@ -1686,8 +1993,12 @@ def multipair_scan_and_trade(binance, bybit, cfg: Config, logger: TradeLogger, f
             for sym in list(open_syms):
                 # Immediately check/fix asymmetry before any TP/SL calculations
                 try:
-                    if not _reconcile_legs(sym, binance, bybit, logger):
-                        continue
+                    if cfg.trend_follow:
+                        if not _reconcile_legs_same_side(sym, binance, bybit, logger):
+                            continue
+                    else:
+                        if not _reconcile_legs(sym, binance, bybit, logger):
+                            continue
                 except Exception as e:
                     console.print(f"[yellow]Reconcile error on {sym}: {e}[/yellow]")
                 try:
