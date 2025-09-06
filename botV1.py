@@ -29,7 +29,7 @@ class BotState:
 TELE: Optional[TelegramManager] = None
 STATE = BotState()
 RUNNING = True  # NEW: global switch to exit loops
-_BINANCE_HEDGE_CACHE: Optional[bool] = None  # cache Binance position mode
+# No hedge-mode support; Binance is assumed One-way
 
 # ==========================
 # Config
@@ -496,42 +496,7 @@ def init_exchanges():
 
     return binance, bybit
 
-def _is_binance_hedge_mode(ex) -> bool:
-    """Detect if Binance USD-M is in Hedge Mode (dual side). Caches result.
-
-    Returns True for hedge mode, False otherwise.
-    """
-    global _BINANCE_HEDGE_CACHE
-    try:
-        if getattr(ex, "id", "") != "binanceusdm":
-            return False
-        if _BINANCE_HEDGE_CACHE is not None:
-            return bool(_BINANCE_HEDGE_CACHE)
-        # Env override if provided
-        env_val = os.getenv("BINANCE_HEDGE_MODE")
-        if env_val is not None:
-            _BINANCE_HEDGE_CACHE = str(env_val).strip().lower() in ("1", "true", "yes", "on")
-            return bool(_BINANCE_HEDGE_CACHE)
-        # Try Binance endpoint via ccxt to detect dual side position mode
-        for name in ("fapiPrivateGetPositionsideDual", "fapiPrivateGetPositionSideDual"):
-            fn = getattr(ex, name, None)
-            if callable(fn):
-                try:
-                    d = fn({}) or {}
-                    dual = d.get("dualSidePosition")
-                    if isinstance(dual, bool):
-                        _BINANCE_HEDGE_CACHE = dual
-                        return dual
-                    if isinstance(dual, str):
-                        val = dual.strip().lower() in ("true", "1")
-                        _BINANCE_HEDGE_CACHE = val
-                        return val
-                except Exception:
-                    pass
-        _BINANCE_HEDGE_CACHE = False
-    except Exception:
-        _BINANCE_HEDGE_CACHE = False
-    return bool(_BINANCE_HEDGE_CACHE)
+# Hedge mode is not supported in this bot (Binance One-way only)
 
 # ==========================
 # Funding & positions
@@ -1224,23 +1189,45 @@ def _close_leg_reduce_only(ex, symbol: str):
             continue
         contracts = _to_float(p.get("contracts"))
         side = _position_side(p, contracts)
-        params = {"reduceOnly": True}
-        # Bybit prefers IOC for reduce-only market to ensure immediate execution
-        if getattr(ex, "id", "") == "bybit":
-            params["timeInForce"] = "IOC"
-        # Binance: only include positionSide when in hedge mode; omit in One-way mode
-        if getattr(ex, "id", "") == "binanceusdm":
-            if _is_binance_hedge_mode(ex):
-                if side == "long":
-                    params["positionSide"] = "LONG"
-                elif side == "short":
-                    params["positionSide"] = "SHORT"
-            # Faster acknowledgement from Binance
-            params["newOrderRespType"] = "RESULT"
+
+        # Build base params
+        base_params: Dict[str, Any] = {"reduceOnly": True}
+        ex_id = getattr(ex, "id", "")
+        if ex_id == "bybit":
+            base_params["timeInForce"] = "IOC"  # ensure immediate execution on Bybit
+        if ex_id == "binanceusdm":
+            base_params["newOrderRespType"] = "RESULT"
+
+        # One-way mode only: single param candidate (no positionSide)
+        param_candidates: List[Dict[str, Any]] = [base_params]
+
+        def _place(side_close: str, amount: float, params: Dict[str, Any]):
+            return _safe_create_order(ex, symbol, "market", side_close, amount, None, params)
+
         if side == "long" and contracts > 0:
-            _safe_create_order(ex, symbol, "market", "sell", abs(contracts), None, params)
+            side_close = "sell"; amt = abs(contracts)
         elif side == "short" and contracts < 0:
-            _safe_create_order(ex, symbol, "market", "buy",  abs(contracts), None, params)
+            side_close = "buy";  amt = abs(contracts)
+        else:
+            continue
+
+        last_err: Optional[Exception] = None
+        for pr in param_candidates:
+            try:
+                _place(side_close, amt, pr)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                # Try next param variant if available
+                continue
+        if last_err is not None:
+            try:
+                console.print(f"Close failed on {ex_id} {symbol}: {last_err}")
+                if TELE:
+                    TELE.send(f"CLOSE FAIL {symbol} on {ex_id}: {last_err}")
+            except Exception:
+                pass
 
 _LAST_FIX_TS: Dict[str, float] = {}
 
@@ -1477,15 +1464,28 @@ def _close_leg_reduce_only_single(ex, symbol: str):
             return f"{ex.id} {symbol}: no position"
         side = _position_side(p, contracts)
         amt = abs(contracts)
-        try:
-            params = {"reduceOnly": True}
-            if getattr(ex, "id", "") == "bybit":
-                params["timeInForce"] = "IOC"
-            side_close = "sell" if side == "long" else "buy"
-            ex.create_order(symbol, "market", side_close, amt, None, params)
-            return f"{ex.id} {symbol}: closed {side} {amt:g}"
-        except Exception as e:
-            return f"{ex.id} {symbol} close failed: {e}"
+        ex_id = getattr(ex, "id", "")
+
+        # Base params
+        base_params: Dict[str, Any] = {"reduceOnly": True}
+        if ex_id == "bybit":
+            base_params["timeInForce"] = "IOC"
+        if ex_id == "binanceusdm":
+            base_params["newOrderRespType"] = "RESULT"
+
+        # One-way mode only: single param candidate (no positionSide)
+        param_candidates: List[Dict[str, Any]] = [base_params]
+
+        side_close = "sell" if side == "long" else "buy"
+        last_err: Optional[Exception] = None
+        for pr in param_candidates:
+            try:
+                ex.create_order(symbol, "market", side_close, amt, None, pr)
+                return f"{ex.id} {symbol}: closed {side} {amt:g}"
+            except Exception as e:
+                last_err = e
+                continue
+        return f"{ex.id} {symbol} close failed: {last_err}"
     return f"{ex.id} {symbol}: not found"
 
 def _close_cmd(arg: str, binance, bybit) -> str:
